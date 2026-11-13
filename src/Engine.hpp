@@ -185,7 +185,9 @@ private:
     std::vector<AiSeg> m_aiPlan;       // the route autoplay is following
     int m_aiPlanPos = 0;               // ticks already played of it
     int m_aiPlanTotal = 0;             // its length in ticks
-    int m_aiVariant = 0;               // which of the candidate routes is being searched
+    int m_forceLen = 0;                // route search: the first levels are fixed (a branch)
+    bool m_force[kSlots] = {};
+    bool m_aiContinuous = false;       // ship / wave: the default is "keep the input"; click modes: "do nothing"
     bool m_planHold[kSlots] = {};
     int m_planSeg[kSlots] = {};
     int m_planLen = 0;
@@ -1397,15 +1399,18 @@ private:
 
         int seg = m_levels[level];
         int cell = aiCell(m_p[0][s]->getPositionX());
-        bool order[2] = {prevHold, !prevHold};            // keeping the input is the default
-        if (aiBad(cell, order[1]) + 0.01f < aiBad(cell, order[0])) std::swap(order[0], order[1]);
-        if (m_aiVariant > 0) {                            // candidate routes deviate from the default now and then
-            uint32_t h = static_cast<uint32_t>(m_aiVariant) * 2654435761u + static_cast<uint32_t>(level) * 40503u;
-            if (((h >> 9) % 3) == 0) std::swap(order[0], order[1]);
+        // default first: click modes do nothing, ship / wave keep their input. The other
+        // action is only tried when the default dies (or when a branch forces it).
+        bool def = m_aiContinuous ? prevHold : false;
+        bool order[2] = {def, !def};
+        int count = 2;
+        if (level < m_forceLen) {
+            order[0] = m_force[level];
+            count = 1;
         }
         float prune = static_cast<float>(cfg().autoPrune);
 
-        for (int k = 0; k < 2; ++k) {
+        for (int k = 0; k < count; ++k) {
             bool h = order[k];
             float bh = aiBad(cell, h);
             float bo = aiBad(cell, !h);
@@ -1443,7 +1448,7 @@ private:
             m_trail.resize(mark);
             if (m_aborted) return false;
         }
-        m_failMemo.insert(key);
+        if (level >= m_forceLen) m_failMemo.insert(key);   // a forced level only tried one action
         return false;
     }
 
@@ -1453,8 +1458,37 @@ private:
         m_aiPlanTotal = 0;
     }
 
-    // Thinks up cfg().autoPaths different routes (hold / release per segment), keeps the one
-    // that survives longest and stores it in m_aiPlan. true = it survives the whole look-ahead.
+    // Does the plan survive when it is shifted by `shift` ticks (late > 0 / early < 0)?
+    bool aiSurvives(std::vector<AiSeg> const& plan, int shift, bool prev) {
+        copySlot(1, 0);
+        for (int t = 0; t < m_aiHorizon; ++t) {
+            int idx = t - shift;
+            bool h = prev;
+            if (idx >= 0) {
+                int acc = 0;
+                h = plan.back().hold;
+                for (auto const& st : plan) {
+                    if (idx < acc + st.seg) {
+                        h = st.hold;
+                        break;
+                    }
+                    acc += st.seg;
+                }
+            }
+            if (!step(1, h)) return false;
+            if (m_info[1].unknown) break;
+        }
+        return true;
+    }
+
+    // Route search. A route (pattern) is a hold / release sequence over the look-ahead.
+    //  1. Route 1: "do nothing" until something ahead would kill, then act; go on until the
+    //     look-ahead ends. Dead end (even acting at every step) = that route is over.
+    //  2. Every spot where doing nothing was fine but acting was possible becomes a branch:
+    //     go back to it, act there, and continue the same way from that point (route 2, 3, ...).
+    //  3. Of the complete routes the most stable one is followed: the one that still lives when
+    //     all its timings are shifted by -2..+2 ticks, then the one with fewer switches.
+    // m_aiPlan = the chosen route. true = it survives the whole look-ahead.
     bool planAuto(PlayLayer* pl) {
         auto& c = cfg();
         int s0 = std::max(1, c.autoStride);
@@ -1470,61 +1504,115 @@ private:
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);   // autoplay: one input, both players
         loadReal(0);
         m_failMemo.clear();                                        // dead states stay dead for every route
+        m_aiContinuous = isContinuous(detectMode(pl->m_player1));
 
         int paths = std::max(1, c.autoPaths);
-        int per = std::max(100, c.autoBudget / paths);
         bool prev = m_game[0];
-        std::vector<AiSeg> best;
-        std::vector<TrailPt> bestTrail;
-        int bestScore = -1;
-        int bestTotal = 0;
-        bool bestOk = false;
+        bool genDefault = m_aiContinuous ? prev : false;
+        (void)genDefault;
 
-        for (int v = 0; v < paths; ++v) {
-            m_aiVariant = v;
-            m_aborted = false;
-            m_budget = m_used + per;
+        struct Route {
+            std::vector<AiSeg> plan;
+            std::vector<bool> holds;
+            std::vector<TrailPt> trail;
+            int len = 0;
+            int toggles = 0;
+            int tol = 0;
+        };
+        std::vector<Route> routes;
+        std::vector<AiSeg> partial;
+        int partialReach = -1;
+
+        std::deque<std::vector<bool>> seeds;
+        seeds.push_back({});                                       // no forced action = route 1
+        m_budget = m_used + c.autoBudget;
+        int attempts = 0;
+        int maxAttempts = paths * 8;
+
+        while (!seeds.empty() && static_cast<int>(routes.size()) < paths && attempts < maxAttempts) {
+            std::vector<bool> prefix = std::move(seeds.front());
+            seeds.pop_front();
+            if (m_aborted || m_used >= m_budget) break;
+            ++attempts;
+
+            m_forceLen = static_cast<int>(prefix.size());
+            for (int i = 0; i < m_forceLen; ++i) m_force[i] = prefix[i];
             m_bestReach = -1;
             m_bestLen = 0;
             m_planLen = 0;
             m_trail.clear();
             bool ok = aiDfs(0, 0, 0, prev);
 
-            std::vector<AiSeg> plan;
-            int len = 0;
-            int score;
             if (ok && m_planLen > 0) {
-                for (int i = 0; i < m_planLen; ++i) {
-                    plan.push_back({m_planHold[i], m_planSeg[i]});
-                    len += m_planSeg[i];
+                std::vector<bool> holds(m_planHold, m_planHold + m_planLen);
+                bool dup = false;
+                for (auto const& r : routes) dup = dup || r.holds == holds;
+                if (!dup) {
+                    Route r;
+                    r.holds = holds;
+                    bool p = prev;
+                    for (int i = 0; i < m_planLen; ++i) {
+                        r.plan.push_back({m_planHold[i], m_planSeg[i]});
+                        r.len += m_planSeg[i];
+                        if (m_planHold[i] != p) ++r.toggles;
+                        p = m_planHold[i];
+                    }
+                    if (m_wantTrail) r.trail = m_trail;
+                    routes.push_back(std::move(r));
                 }
-                score = 1000000 + len;
-            } else {
-                ok = false;
-                for (int i = 0; i < m_bestLen; ++i) plan.push_back({m_bestHold[i], m_bestSeg[i]});
-                len = std::max(0, m_bestReach);
-                score = len;
-            }
-            if (!plan.empty() && score > bestScore) {
-                bestScore = score;
-                best = std::move(plan);
-                bestTotal = len;
-                bestOk = ok;
-                if (m_wantTrail && ok) bestTrail = m_trail;
+                // branches: every spot where the default was fine but acting was possible too
+                bool p = prev;
+                for (int i = 0; i < m_planLen; ++i) {
+                    bool def = m_aiContinuous ? p : false;
+                    if (i >= m_forceLen && m_planHold[i] == def) {
+                        std::vector<bool> seed(m_planHold, m_planHold + i);
+                        seed.push_back(!def);
+                        seeds.push_back(std::move(seed));
+                    }
+                    p = m_planHold[i];
+                }
+            } else if (m_bestReach > partialReach && m_bestLen > 0) {
+                partialReach = m_bestReach;
+                partial.clear();
+                for (int i = 0; i < m_bestLen; ++i) partial.push_back({m_bestHold[i], m_bestSeg[i]});
             }
         }
-        m_aiVariant = 0;
+        m_forceLen = 0;
 
-        if (best.empty()) {
-            best.push_back({prev, 1});
-            bestTotal = 1;
+        // stability: survive the same route with every timing shifted
+        int best = -1;
+        long bestScore = -1;
+        if (!routes.empty()) {
+            m_aborted = false;
+            m_budget = m_used + static_cast<int>(routes.size()) * 4 * m_aiHorizon + 64;
+            for (size_t i = 0; i < routes.size(); ++i) {
+                static constexpr int shifts[4] = {-2, -1, 1, 2};
+                for (int sh : shifts) {
+                    if (aiSurvives(routes[i].plan, sh, prev)) ++routes[i].tol;
+                }
+                long score = 1000000L + routes[i].tol * 10000L - routes[i].toggles * 100L + routes[i].len;
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = static_cast<int>(i);
+                }
+            }
         }
-        m_aiPlan = std::move(best);
+
+        bool ok = best >= 0;
+        if (ok) {
+            m_aiPlan = routes[best].plan;
+            m_aiPlanTotal = std::max(1, routes[best].len);
+            if (m_wantTrail) m_trailOk = routes[best].trail;
+        } else if (!partial.empty()) {
+            m_aiPlan = partial;
+            m_aiPlanTotal = std::max(1, partialReach);
+        } else {
+            m_aiPlan.assign(1, AiSeg{prev, 1});
+            m_aiPlanTotal = 1;
+        }
         m_aiPlanPos = 0;
-        m_aiPlanTotal = std::max(1, bestTotal);
-        if (m_wantTrail && bestOk) m_trailOk = std::move(bestTrail);
         endSearch();
-        return bestOk;
+        return ok;
     }
 
     void autoTick(PlayLayer* pl) {
@@ -1696,6 +1784,8 @@ private:
 
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);
         m_budget = c.pathBudget;
+        m_forceLen = 0;
+        m_aiContinuous = isContinuous(detectMode(p1));
         m_wantTrail = true;                                  // aiDfs records the route in m_trail
         loadReal(0);
         m_failMemo.clear();
