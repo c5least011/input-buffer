@@ -252,7 +252,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         bool track = button == 1 && !g_engine.isSimulating() && PlayLayer::get();
         if (track) g_engine.beginHandle();
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
-        if (track) g_engine.endHandle(isPlayer1);      // learn which player the game gave it to
+        if (track) g_engine.endHandle(isPlayer1, down);      // learn which player the game gave it to
     }
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
