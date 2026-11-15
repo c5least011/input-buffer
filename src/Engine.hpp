@@ -158,6 +158,12 @@ private:
     // drives player 1. kNobody = the game gave that side to no player.
     int m_sideMapSolo[2] = {-1, -1};
     static constexpr int kNobody = 3;
+    // The real fingers, per screen side ([isPlayer1 ? 1 : 0]), taken from every real event
+    // before anything is filtered, delayed or remapped. This is the ground truth the held-back
+    // state is checked against (reconcile): a missed event must never leave a hold stuck.
+    bool m_raw[2] = {false, false};
+    int m_stuck[2] = {0, 0};           // ticks the game has been held with no finger on it
+    int m_sweep = 0;                   // >0: just back in solo, one release sweep is due
     bool m_inHandle = false;
     PlayerObject* m_recvP = nullptr;
     int m_recvCount = 0;
@@ -225,6 +231,9 @@ public:
         quit();
         m_sideMap[0] = m_sideMap[1] = -1;
         m_sideMapSolo[0] = m_sideMapSolo[1] = -1;
+        m_raw[0] = m_raw[1] = false;
+        m_stuck[0] = m_stuck[1] = 0;
+        m_sweep = 0;
         PlayLayer* pl = PlayLayer::get();
         if (!pl) return;
         for (int i = 0; i < kSlots; ++i) {
@@ -629,6 +638,59 @@ public:
         return (other == 0 || other == 1) ? 1 - other : -1;
     }
 
+    // Is a finger on a side that drives player `pi`? known = false when that cannot be told.
+    bool fingerOn(PlayLayer* pl, int pi, bool& known) const {
+        known = true;
+        if (m_layout == Layout::Solo) {
+            if (twoFlagOf(pl)) {
+                bool seen = false;
+                bool any = false;
+                for (int sd = 0; sd < 2; ++sd) {
+                    if (m_sideMapSolo[sd] != 0) continue;
+                    seen = true;
+                    any = any || m_raw[sd];
+                }
+                known = seen;
+                return any;
+            }
+            return cfg().bothSides ? (m_raw[0] || m_raw[1]) : m_raw[1];
+        }
+        if (m_layout == Layout::TwoPlayer) {
+            for (int sd = 0; sd < 2; ++sd) {
+                if (sideOwner(sd == 1) == pi) return m_raw[sd];
+            }
+        }
+        known = false;                                  // dual in a 1-player level: not sure how
+        return false;                                   // the game spreads a tap, so no guessing
+    }
+
+    // Safety net for the input bookkeeping. It only ever RELEASES (a press made up from stale
+    // state would be worse than the bug): if the game was told "hold", nothing is being held
+    // back, and no finger is on that player's side for 3 ticks, the hold is stuck: release it.
+    // After coming back to solo (dual ended) the game gets one release regardless of what the
+    // mod believes, because the game itself may have kept the hold.
+    void reconcile(PlayLayer* pl, int n) {
+        for (int pi = 0; pi < n; ++pi) {
+            PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
+            bool known = false;
+            bool candidate = po && !po->m_isDead && m_pend[pi].empty() && m_game[pi];
+            bool down = candidate ? fingerOn(pl, pi, known) : true;
+            if (!candidate || !known || down) {
+                m_stuck[pi] = 0;
+                continue;
+            }
+            if (++m_stuck[pi] < 3) continue;
+            m_stuck[pi] = 0;
+            fire(pl, pi, false);
+        }
+        if (m_sweep > 0 && --m_sweep == 0 && m_layout == Layout::Solo) {
+            PlayerObject* p1 = pl->m_player1;
+            bool known = false;
+            bool down = fingerOn(pl, 0, known);
+            if (p1 && !p1->m_isDead && m_pend[0].empty() && known && !down) fire(pl, 0, false);
+        }
+    }
+
     // the isPlayer1 flag the game turns into player `pi` (inverse of sideOwner)
     bool sideFlagFor(int pi) const {
         if (sideOwner(true) == pi) return true;
@@ -654,6 +716,7 @@ public:
         Layout lay = layoutOf(pl);
         m_layout = lay;
         bool origP1 = isP1;
+        m_raw[origP1 ? 1 : 0] = push;                  // the real finger, before any filtering
 
         {   // autoplay: the bot drives the input, your taps are ignored
             int fr = static_cast<int>(CCDirector::sharedDirector()->getTotalFrames());
@@ -831,6 +894,7 @@ public:
                 m_phys[1] = false;
                 m_game[1] = false;
             }
+            if (m_layout == Layout::Solo) m_sweep = 6;     // back to solo: check nothing stays held
             m_prevLayout = m_layout;
         }
         auto& cf = cfg();
@@ -864,6 +928,7 @@ public:
         int n = m_layout == Layout::Solo ? 1 : 2;
         m_justDecided = false;
         for (int pi = 0; pi < n; ++pi) tickPlayer(pl, pi);
+        if (cf.enabled && m_ready) reconcile(pl, n);
         if (!m_justDecided) overlayTick(pl);
     }
 
