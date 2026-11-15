@@ -21,7 +21,7 @@ struct Config {
     bool orbDetect = true;
     bool dropFatal = false;
     bool twoPlayerMode = true;          // handle real 2-player mode (off = untouched)
-    bool swapTwoPlayer = true;          // 2-player mode: the two screen sides are swapped (left <-> right)
+    bool swapTwoPlayer = true;          // unused since the side -> player mapping is learned; kept so old saves load
     bool moveDetect = true;             // a running move trigger makes the prediction back off
     // display
     int previewLen = 60;                // ticks of the live preview
