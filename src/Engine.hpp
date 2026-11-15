@@ -152,7 +152,12 @@ private:
     int m_dbgFlag = -1;                // isPlayer1 of the last real input
     int m_dbgRecv = -1;                // -1 none, 0 / 1 = player that got it, 2 = both
     int m_dbgPi = -1;                  // player the mod judged it as
-    int m_sideMap[2] = {-1, -1};       // [isPlayer1 ? 1 : 0] -> player index
+    int m_sideMap[2] = {-1, -1};       // [isPlayer1 ? 1 : 0] -> player index (2-player mode, dual on)
+    // 2-player level, dual OFF: [isPlayer1 ? 1 : 0] -> player that gets it. "Always limit
+    // controls" can leave one side driving nobody, "flip 2-player controls" decides which side
+    // drives player 1. kNobody = the game gave that side to no player.
+    int m_sideMapSolo[2] = {-1, -1};
+    static constexpr int kNobody = 3;
     bool m_inHandle = false;
     PlayerObject* m_recvP = nullptr;
     int m_recvCount = 0;
@@ -219,6 +224,7 @@ public:
     void init() {
         quit();
         m_sideMap[0] = m_sideMap[1] = -1;
+        m_sideMapSolo[0] = m_sideMapSolo[1] = -1;
         PlayLayer* pl = PlayLayer::get();
         if (!pl) return;
         for (int i = 0; i < kSlots; ++i) {
@@ -428,24 +434,46 @@ public:
             m_recvCount = 2;
         }
     }
-    void endHandle(bool isPlayer1) {
+    void endHandle(bool isPlayer1, bool down) {
         m_inHandle = false;
         PlayLayer* pl = PlayLayer::get();
         if (!pl) return;
         if (m_recvCount == 0) m_dbgRecv = -1;
         else if (m_recvCount > 1) m_dbgRecv = 2;
         else m_dbgRecv = m_recvP == pl->m_player1 ? 0 : (m_recvP == pl->m_player2 ? 1 : -1);
-        if (m_layout != Layout::TwoPlayer || m_recvCount != 1) return;
-        int idx = m_dbgRecv;
-        if (idx >= 0) m_sideMap[isPlayer1 ? 1 : 0] = idx;
+        int side = isPlayer1 ? 1 : 0;
+        if (m_layout == Layout::TwoPlayer) {
+            if (m_dbgRecv == 0 || m_dbgRecv == 1) {
+                m_sideMap[side] = m_dbgRecv;
+                syncDelivered(m_dbgRecv, down);
+            }
+        } else if (m_layout == Layout::Solo && twoFlagOf(pl)) {
+            if (m_dbgRecv == 0 || m_dbgRecv == 1) {
+                m_sideMapSolo[side] = m_dbgRecv;
+                syncDelivered(m_dbgRecv, down);
+            } else if (m_dbgRecv == -1 && pl->m_player1 && !pl->m_player1->m_isDead) {
+                m_sideMapSolo[side] = kNobody;     // trusted only while player 1 is alive
+            }
+        }
+    }
+
+    // The game just gave this event to player `idx`: that is what the game has been told, whatever
+    // the mod judged beforehand. Only a real tap moves the finger state (fire() replays old ones).
+    void syncDelivered(int idx, bool down) {
+        m_game[idx] = down;
+        if (!m_firing) m_phys[idx] = down;
     }
 
     // shown at the bottom of the Log page: what the mod sees for the last input
     std::string inputInfo() const {
         static constexpr char const* lay[3] = {"Solo", "Dual", "2P"};
-        auto pn = [](int v) { return v < 0 ? std::string("?") : (v > 1 ? std::string("both") : "P" + std::to_string(v + 1)); };
-        return fmt::format("{} | game sends side true->{} false->{} | last input: side {} game gave it to {}, mod judged {} | inputs P1 {} P2 {}",
+        auto pn = [](int v) {
+            return v < 0 ? std::string("?") : (v == kNobody ? std::string("none")
+                   : (v > 1 ? std::string("both") : "P" + std::to_string(v + 1)));
+        };
+        return fmt::format("{} | game sends side true->{} false->{} (dual off: true->{} false->{}) | last input: side {} game gave it to {}, mod judged {} | inputs P1 {} P2 {}",
                            lay[static_cast<int>(m_layout)], pn(m_sideMap[1]), pn(m_sideMap[0]),
+                           pn(m_sideMapSolo[1]), pn(m_sideMapSolo[0]),
                            m_dbgFlag < 0 ? "?" : (m_dbgFlag ? "true" : "false"), pn(m_dbgRecv), pn(m_dbgPi),
                            m_dbgIn[0], m_dbgIn[1]);
     }
@@ -592,6 +620,22 @@ public:
                (pl->m_levelSettings && pl->m_levelSettings->m_twoPlayerMode);
     }
 
+    // 2-player mode, dual on: the player a side belongs to (-1 = not learned). The two sides
+    // always drive different players, so one known side gives the other.
+    int sideOwner(bool isPlayer1) const {
+        int own = m_sideMap[isPlayer1 ? 1 : 0];
+        if (own == 0 || own == 1) return own;
+        int other = m_sideMap[isPlayer1 ? 0 : 1];
+        return (other == 0 || other == 1) ? 1 - other : -1;
+    }
+
+    // the isPlayer1 flag the game turns into player `pi` (inverse of sideOwner)
+    bool sideFlagFor(int pi) const {
+        if (sideOwner(true) == pi) return true;
+        if (sideOwner(false) == pi) return false;
+        return pi == 0;
+    }
+
     static Layout layoutOf(PlayLayer* pl) {
         bool dual = pl->m_gameState.m_isDualMode && pl->m_player2;
         if (!dual) return Layout::Solo;
@@ -623,20 +667,36 @@ public:
 
         // "both sides = player 1" only in solo outside 2-player levels: there the
         // game already routes left / right to its own players
-        bool remap = lay == Layout::Solo && c.bothSides && !twoFlagOf(pl);
-        if (lay == Layout::Solo && !remap && !origP1) {
+        bool twoLvl = twoFlagOf(pl);
+        bool remap = lay == Layout::Solo && c.bothSides && !twoLvl;
+        if (lay == Layout::Solo && twoLvl) {
+            // 2-player level while dual is off: which side drives player 1 depends on the game's
+            // "flip 2-player controls" and "always limit controls". The game shows it on the
+            // first input (endHandle), so until then the event is left alone.
+            int who = m_sideMapSolo[origP1 ? 1 : 0];
+            if (who != 0) {
+                m_dbgFlag = origP1 ? 1 : 0;
+                m_dbgPi = -1;
+                if (who == 1) m_phys[1] = push;           // not ours, but the finger is real
+                return true;
+            }
+        } else if (lay == Layout::Solo && !remap && !origP1) {
             m_phys[1] = push;                          // not ours to handle, but the finger is real
             return true;
         }
         // Solo: one player. Dual / 2-player: every event belongs to the player it
         // came from, and every player is its own buffer (own mode, own delay).
         int pi = (lay != Layout::Solo && !origP1) ? 1 : 0;
-        // 2-player mode: the game hands the sides to the players the other way round
-        // (tapping the left side was judged with the wrong player's mode and state)
+        // 2-player mode: the game decides which side drives which player (flip 2-player
+        // controls). Never guessed: the real input shows it, and one known side gives the other.
         if (lay == Layout::TwoPlayer) {
-            int learned = m_sideMap[origP1 ? 1 : 0];
-            if (learned >= 0) pi = learned;                 // what the game really does
-            else if (c.swapTwoPlayer) pi = 1 - pi;          // not learned yet: the manual setting
+            int who = sideOwner(origP1);
+            if (who < 0) {
+                m_dbgFlag = origP1 ? 1 : 0;
+                m_dbgPi = -1;
+                return true;                               // not learned yet: leave it alone
+            }
+            pi = who;
         }
 
         ++m_dbgInputs;
@@ -926,9 +986,10 @@ private:
         m_game[pi] = push;
         bool isP1 = (pi == 0);
         if (m_layout == Layout::TwoPlayer) {                // back to the side the game uses for this player
-            if (m_sideMap[1] == pi) isP1 = true;
-            else if (m_sideMap[0] == pi) isP1 = false;
-            else if (cfg().swapTwoPlayer) isP1 = !isP1;
+            isP1 = sideFlagFor(pi);
+        } else if (m_layout == Layout::Solo && twoFlagOf(pl)) {
+            if (m_sideMapSolo[1] == 0) isP1 = true;         // the side that really drives player 1
+            else if (m_sideMapSolo[0] == 0) isP1 = false;
         }
         pl->handleButton(push, 1, isP1);
         m_firing = false;
