@@ -1271,13 +1271,9 @@ private:
         beginSearch(pl, pi);
         loadReal(0);
 
-        // A delay is "safe" if the click survives. If no delay is fully safe we
-        // still pick the one whose death position is clearly further than the
-        // delays before it.
-        int gain = std::max(1, c.gainClick);
+        // A delay is "safe" if the click survives. If no delay (0..max) survives, nothing
+        // can be saved: the click goes through raw.
         int foundDelay = -1;
-        int bestDelay = 0;
-        int bestTicks = -1;
 
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
@@ -1305,31 +1301,28 @@ private:
                 if (m_aborted) break;
             }
             if (ok || m_aborted) break;
-            if (bestTicks < 0 || reach >= bestTicks + gain) {   // death position
-                bestTicks = reach;
-                bestDelay = d;
-            }
         }
 
         if (foundDelay >= 0) {
             r.known = true;
             r.delay = foundDelay;
-        } else {
-            r.known = !m_aborted || bestDelay > 0;
-            r.delay = bestDelay;
-            if (r.known && c.dropFatal && bestDelay == 0 && !m_aborted) {
-                loadReal(0);
-                bool alive = true;
-                for (int t = 0; t < horizon && alive; ++t) alive = step(0, m_game[pi]);
-                r.drop = alive && !m_aborted;
+        } else if (c.dropFatal && !m_aborted) {
+            // no delay saves it; dropping the click is the one rescue left (opt-in), and only
+            // when NOT clicking survives
+            loadReal(0);
+            bool alive = true;
+            for (int t = 0; t < horizon && alive; ++t) alive = step(0, m_game[pi]);
+            if (alive && !m_aborted) {
+                r.known = true;
+                r.drop = true;
             }
-        }
+        }   // else: nothing saves it -> raw click
 
         ++m_dbgSearches;
         m_lastText = fmt::format(
-            "P{} click d={} {} best={}t used={}{}",
-            pi + 1, r.delay, foundDelay >= 0 ? "SAFE" : (r.drop ? "DROP" : "no-safe"),
-            bestTicks, m_used, m_aborted ? " ABORT" : ""
+            "P{} click d={} {} used={}{}",
+            pi + 1, r.delay, foundDelay >= 0 ? "SAFE" : (r.drop ? "DROP" : "raw"),
+            m_used, m_aborted ? " ABORT" : ""
         );
         endSearch();
         return r;
@@ -1338,26 +1331,19 @@ private:
     // ========================================================= ship / wave
     // The new hold / release state is assumed to stay for the look-ahead.
     //  - a delay (0..max) survives the whole look-ahead -> the smallest one wins;
-    //  - otherwise, ONLY if doing it now kills you within `imminent` ticks, the
-    //    delay that pushes the death position back the most wins (it must beat
-    //    the earlier delays by `holdGain` ticks);
-    //  - anything else passes untouched, so the controls stay free.
+    //  - otherwise nothing can be saved and the input passes raw, so the controls stay free.
     Decision decideHold(PlayLayer* pl, Mode mode, int pi, bool target) {
         auto& c = cfg();
         Decision r;
         int maxDelay = c.maxDelay[mode];
         if (maxDelay <= 0) return r;
         int horizon = std::max(1, mode == M_WAVE ? c.waveHorizon : c.shipHorizon);
-        int imminent = mode == M_WAVE ? c.waveImminent : c.shipImminent;
-        int gain = std::max(1, c.holdGain);
 
         beginSearch(pl, pi);
         loadReal(0);
 
         int foundDelay = -1;
         int firstReach = -1;
-        int bestReach = -1;
-        int bestDelay = 0;
 
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
@@ -1388,25 +1374,14 @@ private:
                 break;
             }
             if (m_aborted) break;
-            if (d == 0) {
-                firstReach = reach;
-                bestReach = reach;
-                bestDelay = 0;
-            } else if (reach >= bestReach + gain) {
-                bestReach = reach;
-                bestDelay = d;
-            }
+            if (d == 0) firstReach = reach;
             m_trail.resize(mark);
         }
 
-        int delay = 0;
-        if (foundDelay > 0) delay = foundDelay;
-        else if (foundDelay < 0 && firstReach >= 0 && firstReach < imminent) delay = bestDelay;
-
-        if (delay > 0 && !m_aborted) {
+        if (foundDelay > 0 && !m_aborted) {
             r.known = true;
-            r.delay = delay;
-        }   // else: fine right now, not imminent, nothing helps, or out of budget -> pass through
+            r.delay = foundDelay;
+        }   // else: fine right now, nothing saves it, or out of budget -> raw input
 
         ++m_dbgSearches;
         m_lastText = fmt::format(
