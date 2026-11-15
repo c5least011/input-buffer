@@ -252,7 +252,6 @@ protected:
                 toggle("Pause menu button", &c.pauseButton),
                 toggle("Dual support", &c.dualSupport),
                 toggle("2-player support", &c.twoPlayerMode),
-                toggle("Flip 2player input(didnt work)", &c.swapTwoPlayer),
                 toggle("Both screen sides", &c.bothSides),
                 toggle("Wave angle override", &c.waveAngles),
                 toggle("Move object detect(test)", &c.moveDetect),
