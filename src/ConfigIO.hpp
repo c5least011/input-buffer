@@ -18,33 +18,37 @@ struct Key {
     bool isBool;
     int lo;
     int hi;
+    int def;    // default value (bools: 0 / 1)
 };
 
 inline std::vector<Key> const& keys() {
     static std::vector<Key> k = [] {
         std::vector<Key> v;
-        for (char const* n : {"enabled", "showTraj", "logOn", "dualOn", "bothSides", "previewBoth", "showPath",
-                              "orbDetect", "dropFatal", "twoPlayerOn", "moveDetect", "swapTwoP", "waveAnglesOn",
-                              "autoplay", "autoLearn", "autoKeep"}) {
-            v.push_back({n, true, 0, 0});
+        struct B { char const* n; int def; };
+        for (B b : {B{"enabled", 1}, B{"showTraj", 1}, B{"logOn", 0}, B{"dualOn", 1}, B{"bothSides", 1},
+                    B{"previewBoth", 1}, B{"showPath", 0}, B{"orbDetect", 1}, B{"dropFatal", 0},
+                    B{"twoPlayerOn", 1}, B{"moveDetect", 1}, B{"swapTwoP", 1}, B{"waveAnglesOn", 0},
+                    B{"autoplay", 0}, B{"autoLearn", 1}, B{"autoKeep", 0}}) {
+            v.push_back({b.n, true, 0, 1, b.def});
         }
-        struct I { char const* n; int lo; int hi; };
-        for (I i : {I{"previewLen", 10, 400}, I{"previewEvery", 1, 60}, I{"keepTicks", 0, 2000},
-                    I{"lineWidth", 2, 40}, I{"pathHorizon", 20, 300}, I{"pathEvery", 1, 60},
-                    I{"pathBudget", 200, 20000}, I{"trajOpacity", 10, 100}, I{"settle", 1, 30},
-                    I{"airHorizon", 10, 300}, I{"robotHold", 1, 60}, I{"gainClick", 1, 60},
-                    I{"minBudget", 50, 5000}, I{"noclipTicks", 0, 5000}, I{"failOpen", 1, 60},
-                    I{"waveUp", 3000, 8000}, I{"waveDown", 3000, 8000}, I{"miniUp", 3000, 8500},
-                    I{"miniDown", 3000, 8500}, I{"trajectory", 20, 400}, I{"shipImminent", 2, 120},
-                    I{"waveImminent", 2, 120}, I{"holdGain", 1, 30}, I{"autoHorizon", 20, 300},
-                    I{"autoEvery", 1, 30}, I{"autoPaths", 1, 12}, I{"autoStride", 1, 12},
-                    I{"autoBudget", 200, 20000}, I{"autoCell", 2, 60}, I{"autoWindow", 5, 400},
-                    I{"autoPrune", 1, 20}, I{"autoForget", 20, 2000}, I{"tps", 0, 10000},
-                    I{"fps", 0, 1000}, I{"tapTicks", 1, 40}, I{"budget", 200, 40000},
-                    I{"shipLook", 4, 300}, I{"waveLook", 4, 300}}) {
-            v.push_back({i.n, false, i.lo, i.hi});
+        struct I { char const* n; int lo; int hi; int def; };
+        for (I i : {I{"previewLen", 10, 400, 60}, I{"previewEvery", 1, 60, 6}, I{"keepTicks", 0, 2000, 240},
+                    I{"lineWidth", 2, 40, 8}, I{"pathHorizon", 20, 300, 90}, I{"pathEvery", 1, 60, 6},
+                    I{"pathBudget", 200, 20000, 2500}, I{"trajOpacity", 10, 100, 100}, I{"settle", 1, 30, 6},
+                    I{"airHorizon", 10, 300, 45}, I{"robotHold", 1, 60, 18}, I{"gainClick", 1, 60, 6},
+                    I{"minBudget", 50, 5000, 300}, I{"noclipTicks", 0, 5000, 480}, I{"failOpen", 1, 60, 4},
+                    I{"waveUp", 3000, 8000, 4510}, I{"waveDown", 3000, 8000, 4490}, I{"miniUp", 3000, 8500, 6343},
+                    I{"miniDown", 3000, 8500, 6343}, I{"trajectory", 20, 400, 120}, I{"shipImminent", 2, 120, 16},
+                    I{"waveImminent", 2, 120, 10}, I{"holdGain", 1, 30, 4}, I{"autoHorizon", 20, 300, 70},
+                    I{"autoEvery", 1, 30, 4}, I{"autoPaths", 1, 12, 3}, I{"autoStride", 1, 12, 3},
+                    I{"autoBudget", 200, 20000, 1500}, I{"autoCell", 2, 60, 8}, I{"autoWindow", 5, 400, 48},
+                    I{"autoPrune", 1, 20, 4}, I{"autoForget", 20, 2000, 120}, I{"tps", 0, 10000, 0},
+                    I{"fps", 0, 1000, 0}, I{"tapTicks", 1, 40, 4}, I{"budget", 200, 40000, 3000},
+                    I{"shipLook", 4, 300, 36}, I{"waveLook", 4, 300, 24}}) {
+            v.push_back({i.n, false, i.lo, i.hi, i.def});
         }
-        for (int m = 0; m < M_COUNT; ++m) v.push_back({"maxDelay" + std::to_string(m), false, 0, 64});
+        static constexpr int delays[M_COUNT] = {8, 12, 6, 6, 8, 6, 6, 6};
+        for (int m = 0; m < M_COUNT; ++m) v.push_back({"maxDelay" + std::to_string(m), false, 0, 64, delays[m]});
         return v;
     }();
     return k;
@@ -111,6 +115,29 @@ inline geode::Result<int> apply(matjson::Value const& root) {
     loadConfig();
     saveConfig();
     return geode::Ok(n);
+}
+
+struct Diff {
+    std::string key, value, def;
+};
+struct Preview {
+    std::vector<Diff> changed;   // settings that differ from the defaults
+    int total = 0;               // settings present in the config
+};
+
+// For the preview window: what would this config actually change?
+inline Preview preview(matjson::Value const& values) {
+    Preview p;
+    for (auto const& k : keys()) {
+        if (!values.contains(k.name)) continue;
+        ++p.total;
+        auto const& v = values[k.name];
+        int cur = k.isBool ? (v.asBool().unwrapOr(false) ? 1 : 0) : static_cast<int>(v.asInt().unwrapOr(k.def));
+        if (cur == k.def) continue;
+        auto str = [&](int x) { return k.isBool ? std::string(x ? "ON" : "OFF") : std::to_string(x); };
+        p.changed.push_back({k.name, str(cur), str(k.def)});
+    }
+    return p;
 }
 
 inline std::filesystem::path configsDir() {

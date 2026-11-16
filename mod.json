@@ -19,14 +19,8 @@
   "open-ui": {
    "type": "custom:open-ui",
    "name": "Settings window",
-   "description": "Open the full settings window (delays, trajectory, autoplay...).",
+   "description": "Open the full settings window",
    "default": false
-  },
-  "server-url": {
-   "type": "string",
-   "name": "Config server URL",
-   "description": "Server used for Config.",
-   "default": "https://https://buf-configs.c5leastdb.workers.dev"
   }
  }
 }

@@ -1,0 +1,8 @@
+name = "buf-configs"
+main = "index.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "buf-configs"
+database_id = "de80afce-e44d-4685-b212-7fa0a4672a4f"

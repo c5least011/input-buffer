@@ -444,7 +444,7 @@ protected:
             meta->setPosition({8.f, y - 8.f});
             scroll->m_contentLayer->addChild(meta);
             auto view = hub::button("View", .5f, [id = e.id, nm = e.name] {
-                if (auto p = hub::ConfigViewPopup::create(id, nm, [] { ConfigPopup::refreshCurrent(); })) p->show();
+                if (auto p = hub::ConfigViewPopup::create(id, nm, [] { ConfigPopup::reloadExplore(); })) p->show();
             });
             view->setPosition({w - 34.f, y});
             menu->addChild(view);
@@ -462,7 +462,7 @@ protected:
         pg->setScale(.5f);
         m_page->addChild(pg);
         pg->setPosition(ccp(0.f, -84.f));
-        addNote("Server: " + hub::baseUrl() + "   |   you: " + (hub::playerName().empty() ? "not logged in" : hub::playerName()), -108.f);
+        addNote(hub::playerName().empty() ? std::string("Not logged in (needed to post and like)") : "Logged in as " + hub::playerName(), -108.f);
     }
 
     void buildPage(int tab) {
