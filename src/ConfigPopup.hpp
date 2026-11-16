@@ -5,11 +5,14 @@
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/Scrollbar.hpp>
 #include <cstdlib>
+#include <ctime>
 #include <functional>
 #include <string>
 #include <vector>
 #include "Config.hpp"
 #include "Engine.hpp"
+#include "ConfigIO.hpp"
+#include "ConfigHub.hpp"
 
 using namespace geode::prelude;
 
@@ -24,6 +27,25 @@ protected:
     std::vector<bool*> m_bools;
     bool m_building = false;
     int m_tab = 0;
+
+    // Config tab (page id 7): sub page 0 = Local, 1 = Explore
+    struct Entry {
+        int id = 0;
+        std::string name, author;
+        int64_t likes = 0, downloads = 0;
+    };
+    int m_sub = 0;
+    std::string m_status;
+    CCLabelBMFont* m_statusLabel = nullptr;
+    TextInput* m_search = nullptr;
+    std::string m_query, m_draft;
+    std::vector<Entry> m_entries;
+    int m_pageNo = 1, m_pages = 1;
+    int64_t m_total = 0;
+    bool m_sortTop = true, m_fetched = false, m_loading = false;
+    std::string m_error;
+    geode::async::TaskHolder<geode::utils::file::PickResult> m_pick;
+    geode::async::TaskHolder<geode::utils::web::WebResponse> m_web;
 
     struct Item {
         std::string label;
@@ -56,9 +78,9 @@ protected:
 
         // page ids: 0 General, 1 Delays, 2 Physics, 3 Search, 4 Display, 5 Auto, 6 Log.
         // The log is the first page.
-        static constexpr char const* names[7] = {"General", "Delays", "Physics", "Search", "Display", "Auto", "Log"};
-        static constexpr int order[7] = {6, 0, 1, 2, 3, 4, 5};
-        for (int pos = 0; pos < 7; ++pos) {
+        static constexpr char const* names[8] = {"General", "Delays", "Physics", "Search", "Display", "Auto", "Log", "Config"};
+        static constexpr int order[8] = {6, 0, 1, 2, 3, 4, 5, 7};
+        for (int pos = 0; pos < 8; ++pos) {
             int id = order[pos];
             auto sprite = ButtonSprite::create(names[id], "bigFont.fnt", "GJ_button_05.png", .6f);
             sprite->setScale(.5f);
@@ -67,7 +89,7 @@ protected:
             );
             tab->setTag(id);
             m_tabs.push_back(tab);
-            m_buttonMenu->addChildAtPosition(tab, Anchor::Center, ccp(-180.f + pos * 60.f, 112.f));
+            m_buttonMenu->addChildAtPosition(tab, Anchor::Center, ccp(-182.f + pos * 52.f, 112.f));
         }
         buildPage(6);
         return true;
@@ -222,6 +244,227 @@ protected:
         note->setPosition(ccp(-190.f, -97.f));
     }
 
+    // ------------------------------------------------------------ Config tab
+
+    void setStatus(std::string const& s) {
+        m_status = s;
+        if (m_statusLabel) m_statusLabel->setString(s.c_str());
+    }
+
+    void addButton(char const* text, float scale, CCPoint pos, std::function<void()> cb) {
+        auto b = hub::button(text, scale, std::move(cb));
+        m_buttonMenu->addChildAtPosition(b, Anchor::Center, pos);
+        m_pageButtons.push_back(b);
+    }
+
+    void buildConfigPage() {
+        for (int s = 0; s < 2; ++s) {
+            addButton(s == 0 ? "Local" : "Explore", s == m_sub ? .55f : .45f, ccp(-35.f + s * 70.f, 86.f), [this, s] {
+                m_sub = s;
+                buildPage(7);
+            });
+        }
+        if (m_sub == 0) buildLocal();
+        else buildExplore();
+    }
+
+    void buildLocal() {
+        addNote("Export writes your settings to a .json file.\n"
+                "Import loads one and applies it (a backup of your current settings is kept).", 52.f);
+        addButton("Export", .7f, ccp(-100.f, 10.f), [this] { doExport(); });
+        addButton("Import", .7f, ccp(0.f, 10.f), [this] { doImport(); });
+        addButton("Open folder", .55f, ccp(100.f, 10.f), [] { geode::utils::file::openFolder(cfgio::configsDir()); });
+
+        m_statusLabel = CCLabelBMFont::create(m_status.c_str(), "chatFont.fnt");
+        m_statusLabel->setScale(.55f);
+        m_statusLabel->setWidth(600.f);
+        m_page->addChild(m_statusLabel);
+        m_statusLabel->setPosition(ccp(0.f, -40.f));
+        addNote("Default folder: " + geode::utils::string::pathToString(cfgio::configsDir()), -100.f);
+    }
+
+    void doExport() {
+        geode::utils::file::FilePickOptions opts;
+        opts.defaultPath = cfgio::configsDir();
+        m_pick.spawn(
+            geode::utils::file::pick(geode::utils::file::PickMode::OpenFolder, std::move(opts)),
+            [this](geode::utils::file::PickResult r) {
+                std::filesystem::path dir = cfgio::configsDir();
+                std::string note;
+                if (r.isErr()) note = " (folder picker failed, used the default folder)";
+                else if (!r.unwrap()) return;                       // cancelled
+                else dir = *r.unwrap();
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                auto path = dir / fmt::format("buf-config-{}.json", static_cast<long long>(std::time(nullptr)));
+                auto w = geode::utils::file::writeString(path, cfgio::exportJson().dump(2));
+                setStatus(w.isOk() ? "Exported: " + geode::utils::string::pathToString(path) + note
+                                   : "Export failed: " + w.unwrapErr());
+            }
+        );
+    }
+
+    void doImport() {
+        geode::utils::file::FilePickOptions opts;
+        opts.defaultPath = cfgio::configsDir();
+        opts.filters.push_back({"Config", {"*.json"}});
+        m_pick.spawn(
+            geode::utils::file::pick(geode::utils::file::PickMode::OpenFile, std::move(opts)),
+            [this](geode::utils::file::PickResult r) {
+                if (r.isErr()) { setStatus("Picker failed: " + r.unwrapErr()); return; }
+                if (!r.unwrap()) return;
+                auto json = cfgio::readFile(*r.unwrap());
+                if (json.isErr()) { setStatus("Import failed: " + json.unwrapErr()); return; }
+                cfgio::backup();
+                auto n = cfgio::apply(json.unwrap());
+                if (n.isErr()) { setStatus("Import failed: " + n.unwrapErr()); return; }
+                m_status = fmt::format("Imported {} settings from {}", n.unwrap(), r.unwrap()->filename().string());
+                buildPage(7);
+            }
+        );
+    }
+
+    void fetchList() {
+        m_fetched = true;
+        m_loading = true;
+        m_error.clear();
+        auto url = fmt::format("{}/configs?q={}&page={}&sort={}", hub::baseUrl(), hub::urlEncode(m_query),
+                               m_pageNo, m_sortTop ? "top" : "new");
+        m_web.spawn(hub::get(url), [this](geode::utils::web::WebResponse res) {
+            m_loading = false;
+            m_entries.clear();
+            auto j = hub::parse(res);
+            if (j.isErr()) {
+                m_error = j.unwrapErr();
+            } else {
+                auto const& v = j.unwrap();
+                m_pages = std::max<int>(1, static_cast<int>(hub::ji(v, "pages", 1)));
+                m_total = hub::ji(v, "total");
+                if (v.contains("items")) {
+                    auto arr = v["items"].asArray();
+                    if (arr.isOk()) {
+                        for (auto const& it : arr.unwrap()) {
+                            Entry e;
+                            e.id = static_cast<int>(hub::ji(it, "id"));
+                            e.name = hub::js(it, "name");
+                            e.author = hub::js(it, "author");
+                            e.likes = hub::ji(it, "likes");
+                            e.downloads = hub::ji(it, "downloads");
+                            m_entries.push_back(std::move(e));
+                        }
+                    }
+                }
+            }
+            if (m_tab == 7 && m_sub == 1) buildPage(7);
+        });
+    }
+
+    static std::string clip(std::string s, size_t n) {
+        if (s.size() > n) { s.resize(n - 2); s += ".."; }
+        return s;
+    }
+
+    void search() {
+        m_query = m_draft;
+        m_pageNo = 1;
+        fetchList();
+        buildPage(7);
+    }
+
+    void gotoPage(int p) {
+        if (p < 1 || p > m_pages || m_loading) return;
+        m_pageNo = p;
+        fetchList();
+        buildPage(7);
+    }
+
+    void buildExplore() {
+        if (!m_fetched) fetchList();
+
+        m_search = TextInput::create(170.f, "Search name...", "bigFont.fnt");
+        m_search->setScale(.7f);
+        m_search->setMaxCharCount(32);
+        m_search->setString(m_query);
+        m_draft = m_query;
+        m_search->setCallback([this](std::string const& s) { if (!m_building) m_draft = s; });
+        m_page->addChild(m_search);
+        m_search->setPosition(ccp(-138.f, 62.f));
+
+        addButton("Search", .5f, ccp(-40.f, 62.f), [this] { search(); });
+        addButton(m_sortTop ? "Top" : "New", .5f, ccp(10.f, 62.f), [this] {
+            m_sortTop = !m_sortTop;
+            m_pageNo = 1;
+            fetchList();
+            buildPage(7);
+        });
+        addButton("Post", .5f, ccp(160.f, 62.f), [this] {
+            if (hub::userKey().empty()) {
+                FLAlertLayer::create("Post", "Log in to your Geometry Dash account to post configs.", "OK")->show();
+                return;
+            }
+            if (auto p = hub::ConfigPostPopup::create([] { ConfigPopup::reloadExplore(); })) p->show();
+        });
+
+        constexpr float w = 392.f, h = 112.f, rowH = 30.f, cy = -10.f;
+        auto bg = CCLayerColor::create({0, 0, 0, 110}, w, h);
+        bg->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        m_page->addChild(bg);
+
+        auto scroll = ScrollLayer::create({w, h});
+        scroll->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        m_page->addChild(scroll);
+
+        float total = std::max(h, static_cast<float>(m_entries.size()) * rowH);
+        scroll->m_contentLayer->setContentSize({w, total});
+
+        std::string msg = m_loading ? "Loading..." : !m_error.empty() ? m_error : m_entries.empty() ? "No configs found" : "";
+        if (!msg.empty()) {
+            auto l = CCLabelBMFont::create(msg.c_str(), "chatFont.fnt");
+            l->setScale(.6f);
+            l->setPosition({w / 2.f, total - h / 2.f});
+            scroll->m_contentLayer->addChild(l);
+        }
+
+        auto menu = CCMenu::create();
+        menu->setPosition({0.f, 0.f});
+        menu->setContentSize({w, total});
+        scroll->m_contentLayer->addChild(menu);
+        float y = total - rowH / 2.f;
+        for (auto const& e : m_entries) {
+            auto name = CCLabelBMFont::create(clip(e.name, 28).c_str(), "bigFont.fnt");
+            name->setScale(.38f);
+            name->setAnchorPoint({0.f, .5f});
+            name->setPosition({8.f, y + 5.f});
+            scroll->m_contentLayer->addChild(name);
+            auto meta = CCLabelBMFont::create(
+                fmt::format("by {}  |  {} likes  |  {} dl", clip(e.author, 18), e.likes, e.downloads).c_str(), "chatFont.fnt");
+            meta->setScale(.5f);
+            meta->setAnchorPoint({0.f, .5f});
+            meta->setOpacity(200);
+            meta->setPosition({8.f, y - 8.f});
+            scroll->m_contentLayer->addChild(meta);
+            auto view = hub::button("View", .5f, [id = e.id, nm = e.name] {
+                if (auto p = hub::ConfigViewPopup::create(id, nm, [] { ConfigPopup::refreshCurrent(); })) p->show();
+            });
+            view->setPosition({w - 34.f, y});
+            menu->addChild(view);
+            y -= rowH;
+        }
+        scroll->m_contentLayer->setPositionY(h - total);        // first row in view
+
+        auto bar = Scrollbar::create(scroll);
+        bar->setPosition(ccp(w / 2.f + 8.f, cy));
+        m_page->addChild(bar);
+
+        addButton("<", .5f, ccp(-40.f, -84.f), [this] { gotoPage(m_pageNo - 1); });
+        addButton(">", .5f, ccp(40.f, -84.f), [this] { gotoPage(m_pageNo + 1); });
+        auto pg = CCLabelBMFont::create(fmt::format("Page {}/{}  ({} configs)", m_pageNo, m_pages, m_total).c_str(), "chatFont.fnt");
+        pg->setScale(.5f);
+        m_page->addChild(pg);
+        pg->setPosition(ccp(0.f, -84.f));
+        addNote("Server: " + hub::baseUrl() + "   |   you: " + (hub::playerName().empty() ? "not logged in" : hub::playerName()), -108.f);
+    }
+
     void buildPage(int tab) {
         m_building = true;
         cfg().pauseButton = Mod::get()->getSettingValue<bool>("pause-button");   // may have been changed in Geode's settings
@@ -236,6 +479,11 @@ protected:
 
         if (tab == 6) {
             buildLogPage();
+            m_building = false;
+            return;
+        }
+        if (tab == 7) {
+            buildConfigPage();
             m_building = false;
             return;
         }
@@ -267,9 +515,6 @@ protected:
                     std::string(kModeNames[i]) + " max delay", &c.maxDelay[i], 0, 64
                 ));
             }
-            items.push_back(number("Ship imminent (ticks)", &c.shipImminent, 2, 120));
-            items.push_back(number("Wave imminent (ticks)", &c.waveImminent, 2, 120));
-            items.push_back(number("Hold min gain (ticks)", &c.holdGain, 1, 30));
             note = "Max ticks a press / release may be held back (0 = mode off).\n"
                    "Ship/Wave only act when holding or releasing NOW would kill you\n"
                    "within 'imminent' ticks and waiting pushes it back by 'min gain'.";
@@ -294,14 +539,12 @@ protected:
                 number("Landing settle (ticks)", &c.settle, 1, 30),
                 number("Air modes look (ticks)", &c.airHorizon, 10, 300),
                 number("Robot long hold", &c.robotHold, 1, 60),
-                number("Min gain (ticks)", &c.gainClick, 1, 60),
                 number("Min budget (ticks)", &c.minBudget, 50, 5000),
                 number("Noclip memory (ticks)", &c.noclipTicks, 0, 5000),
                 number("Fail-open frames", &c.failOpen, 1, 60),
             };
-            note = "Ship/Wave look: a hold/release must survive this many ticks\n"
-                   "Min gain: with no safe delay, a delay\n"
-                   "must survive this much longer than the ones before it.";
+            note = "Ship/Wave look: a hold/release must survive this many ticks.\n"
+                   "If no delay saves it, the input goes through raw.";
         } else if (tab == 5) {
             items = {
                 toggle("Autoplay", &c.autoplay),
@@ -345,6 +588,17 @@ protected:
     }
 
 public:
+    // called by the hub popups (no captured pointers: the window may be gone)
+    static void refreshCurrent() {
+        if (s_current && s_current->getParent()) s_current->buildPage(s_current->m_tab);
+    }
+    static void reloadExplore() {
+        if (!s_current || !s_current->getParent()) return;
+        s_current->m_fetched = false;
+        s_current->m_pageNo = 1;
+        if (s_current->m_tab == 7) s_current->buildPage(7);
+    }
+
     ~ConfigPopup() override {
         if (s_current == this) s_current = nullptr;
     }
