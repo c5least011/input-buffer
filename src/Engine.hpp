@@ -1303,7 +1303,9 @@ private:
     // true  = survived until a stable landing (ground modes) or the whole
     //         trajectory (UFO / Swing, which have no ground to settle on).
     // false = died / budget; `reach` is the tick reached.
-    bool rollClick(int s, int d, int holdTicks, int horizon, bool airMode, int& reach) {
+    // `unk` is set when the run only "survived" because it reached something the ghost cannot
+    // predict (pad, orb, portal...): that is not a verified survival.
+    bool rollClick(int s, int d, int holdTicks, int horizon, bool airMode, int& reach, bool& unk) {
         int tick = d;
         int holdLeft = holdTicks;
         while (true) {
@@ -1315,7 +1317,10 @@ private:
                 return false;
             }
             trailPush(s, 0);
-            if (m_info[s].unknown) return true;      // reached something we cannot predict
+            if (m_info[s].unknown) {                 // reached something we cannot predict
+                unk = true;
+                return true;
+            }
             ++tick;
             reach = std::max(reach, tick);
             if (holdLeft > 0) --holdLeft;
@@ -1356,7 +1361,9 @@ private:
                 m_info[1].groundTicks = 0;
                 size_t mark = m_trail.size();
                 trailPush(0, 1);
-                ok = rollClick(1, d, h, horizon, airMode, reach);
+                bool unk = false;
+                ok = rollClick(1, d, h, horizon, airMode, reach, unk);
+                if (ok && unk && d > 0) ok = false;   // "cannot predict further" is no rescue
                 if (ok) {
                     foundDelay = d;
                     if (m_wantTrail) m_trailOk = m_trail;
@@ -1395,7 +1402,8 @@ private:
 
     // ========================================================= ship / wave
     // The new hold / release state is assumed to stay for the look-ahead.
-    //  - a delay (0..max) survives the whole look-ahead -> the smallest one wins;
+    //  - a delay (0..max) survives the whole look-ahead -> the smallest one wins (a delay that
+    //    only gets there by ending on something unpredictable does not count);
     //  - otherwise nothing can be saved and the input passes raw, so the controls stay free.
     Decision decideHold(PlayLayer* pl, Mode mode, int pi, bool target) {
         auto& c = cfg();
@@ -1422,6 +1430,7 @@ private:
             copySlot(1, 0);
             size_t mark = m_trail.size();
             bool alive = true;
+            bool ended = false;                  // the run stopped on something unpredictable
             int reach = d;
             for (int t = d; t < horizon; ++t) {
                 if (!step(1, target)) {
@@ -1430,10 +1439,16 @@ private:
                     break;
                 }
                 trailPush(1, 0);
-                if (m_info[1].unknown) break;    // prediction ends here: counts as survived
+                if (m_info[1].unknown) {         // prediction ends here
+                    ended = true;
+                    break;
+                }
                 ++reach;
             }
-            if (alive) {
+            // Right now an unpredictable object ahead counts as fine (the input just passes).
+            // A DELAY is only a rescue if it survives the whole look-ahead: steering towards a
+            // pad / orb / portal until the prediction stops proves nothing.
+            if (alive && (d == 0 || !ended)) {
                 foundDelay = d;
                 if (m_wantTrail) m_trailOk = m_trail;
                 break;
