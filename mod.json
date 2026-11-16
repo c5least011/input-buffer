@@ -19,7 +19,7 @@
   "open-ui": {
    "type": "custom:open-ui",
    "name": "Settings window",
-   "description": "Open the full settings window",
+   "description": "Open the full settings window (delays, trajectory, autoplay...).",
    "default": false
   }
  }
