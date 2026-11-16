@@ -229,8 +229,8 @@ public:
     // ---------------------------------------------------------------- lifecycle
     void init() {
         quit();
-        m_sideMap[0] = m_sideMap[1] = -1;
-        m_sideMapSolo[0] = m_sideMapSolo[1] = -1;
+        // m_sideMap / m_sideMapSolo are NOT reset here: which side drives which player is a game
+        // setting, learned once per game session (first click of a 2-player level).
         m_raw[0] = m_raw[1] = false;
         m_stuck[0] = m_stuck[1] = 0;
         m_sweep = 0;
@@ -451,19 +451,26 @@ public:
         else if (m_recvCount > 1) m_dbgRecv = 2;
         else m_dbgRecv = m_recvP == pl->m_player1 ? 0 : (m_recvP == pl->m_player2 ? 1 : -1);
         int side = isPlayer1 ? 1 : 0;
-        if (m_layout == Layout::TwoPlayer) {
+        if (twoFlagOf(pl)) {                                // 2-player level: learn the sides
             if (m_dbgRecv == 0 || m_dbgRecv == 1) {
-                m_sideMap[side] = m_dbgRecv;
-                syncDelivered(m_dbgRecv, down);
-            }
-        } else if (m_layout == Layout::Solo && twoFlagOf(pl)) {
-            if (m_dbgRecv == 0 || m_dbgRecv == 1) {
-                m_sideMapSolo[side] = m_dbgRecv;
+                setSides(side, m_dbgRecv);
                 syncDelivered(m_dbgRecv, down);
             } else if (m_dbgRecv == -1 && pl->m_player1 && !pl->m_player1->m_isDead) {
-                m_sideMapSolo[side] = kNobody;     // trusted only while player 1 is alive
+                // nobody got it while player 1 is alive: this side is player 2's, so the
+                // other one is player 1's
+                setSides(side, 1);
+                if (m_layout == Layout::Solo) m_sideMapSolo[side] = kNobody;
             }
         }
+    }
+
+    // `side` (1 = the isPlayer1 flag) drives `who`; the two sides always drive different players,
+    // so the other side is known too. Kept for the whole session (every 2-player level, dual or not).
+    void setSides(int side, int who) {
+        m_sideMap[side] = who;
+        m_sideMap[1 - side] = 1 - who;
+        m_sideMapSolo[side] = who;
+        m_sideMapSolo[1 - side] = 1 - who;
     }
 
     // The game just gave this event to player `idx`: that is what the game has been told, whatever
