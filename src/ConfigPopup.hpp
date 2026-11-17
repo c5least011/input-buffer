@@ -497,6 +497,7 @@ protected:
                 toggle("Enabled", &c.enabled),
                 toggle("Orb detect(test)", &c.orbDetect),
                 toggle("Drop fatal clicks", &c.dropFatal),
+                toggle("Sub-tick click (CBF)", &c.subTick),
                 toggle("Pause menu button", &c.pauseButton),
                 toggle("Dual support", &c.dualSupport),
                 toggle("2-player support", &c.twoPlayerMode),

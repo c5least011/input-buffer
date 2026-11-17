@@ -28,7 +28,7 @@ inline std::vector<Key> const& keys() {
         for (B b : {B{"enabled", 1}, B{"showTraj", 1}, B{"logOn", 0}, B{"dualOn", 1}, B{"bothSides", 1},
                     B{"previewBoth", 1}, B{"showPath", 0}, B{"orbDetect", 1}, B{"dropFatal", 0},
                     B{"twoPlayerOn", 1}, B{"moveDetect", 1}, B{"swapTwoP", 1}, B{"waveAnglesOn", 0},
-                    B{"autoplay", 0}, B{"autoLearn", 1}, B{"autoKeep", 0}}) {
+                    B{"autoplay", 0}, B{"autoLearn", 1}, B{"autoKeep", 0}, B{"subTick", 1}}) {
             v.push_back({b.n, true, 0, 1, b.def});
         }
         struct I { char const* n; int lo; int hi; int def; };

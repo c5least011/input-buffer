@@ -20,6 +20,7 @@ struct Config {
     bool bothSides = true;              // solo: both screen sides are player 1
     bool orbDetect = true;
     bool dropFatal = false;
+    bool subTick = true;                // click inside a tick, at the exact spot the ghost found (CBF-like)
     bool twoPlayerMode = true;          // handle real 2-player mode (off = untouched)
     bool swapTwoPlayer = true;          // unused since the side -> player mapping is learned; kept so old saves load
     bool moveDetect = true;             // a running move trigger makes the prediction back off
@@ -134,6 +135,7 @@ inline void loadConfig() {
     c.failOpen = gi("failOpen", 4, 1, 60);
     c.orbDetect = gb("orbDetect", true);
     c.dropFatal = gb("dropFatal", false);
+    c.subTick = gb("subTick", true);
     c.twoPlayerMode = gb("twoPlayerOn", true);
     c.moveDetect = gb("moveDetect", true);
     c.swapTwoPlayer = gb("swapTwoP", true);
@@ -199,6 +201,7 @@ inline void saveConfig() {
     m->setSavedValue<int64_t>("failOpen", c.failOpen);
     m->setSavedValue<bool>("orbDetect", c.orbDetect);
     m->setSavedValue<bool>("dropFatal", c.dropFatal);
+    m->setSavedValue<bool>("subTick", c.subTick);
     m->setSavedValue<bool>("twoPlayerOn", c.twoPlayerMode);
     m->setSavedValue<bool>("moveDetect", c.moveDetect);
     m->setSavedValue<bool>("swapTwoP", c.swapTwoPlayer);

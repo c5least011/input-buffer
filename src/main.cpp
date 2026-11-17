@@ -183,10 +183,19 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     void update(float dt) {
+        float split = 1.f;
         if (PlayLayer::get() && !g_engine.isSimulating()) {
             g_engine.setFrameDelta(dt);
             g_engine.addClock(this, dt);
             g_engine.onTick(this);
+            split = g_engine.splitFor(this);
+        }
+        if (split < 1.f) {
+            // sub-tick click (CBF-like): run the first part of the tick, click, run the rest
+            PlayerObject::update(dt * split);
+            g_engine.fireSplit();
+            PlayerObject::update(dt * (1.f - split));
+            return;
         }
         PlayerObject::update(dt);
     }

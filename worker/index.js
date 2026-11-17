@@ -6,7 +6,7 @@ const MAX_PER_USER = 20;
 
 // Limits of the settings a config may contain (must match ConfigIO.hpp).
 const BOOLS = ['enabled', 'showTraj', 'logOn', 'dualOn', 'bothSides', 'previewBoth', 'showPath', 'orbDetect',
-  'dropFatal', 'twoPlayerOn', 'moveDetect', 'swapTwoP', 'waveAnglesOn', 'autoplay', 'autoLearn', 'autoKeep'];
+  'dropFatal', 'twoPlayerOn', 'moveDetect', 'swapTwoP', 'waveAnglesOn', 'autoplay', 'autoLearn', 'autoKeep', 'subTick'];
 const INTS = {
   previewLen: [10, 400], previewEvery: [1, 60], keepTicks: [0, 2000], lineWidth: [2, 40], pathHorizon: [20, 300],
   pathEvery: [1, 60], pathBudget: [200, 20000], trajOpacity: [10, 100], settle: [1, 30], airHorizon: [10, 300],

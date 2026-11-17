@@ -54,6 +54,7 @@ public:
         bool known = false;   // false = pass the event straight through
         int delay = 0;        // ticks to hold the event back
         bool drop = false;    // swallow the click entirely
+        float frac = 1.f;     // 1 = at the start of tick `delay`; < 1 = inside the tick before, after this part of it
     };
 
 private:
@@ -132,7 +133,7 @@ private:
     bool m_phys[2] = {false, false};   // what your finger does
     bool m_game[2] = {false, false};   // what the game has been told
     bool m_supp[2] = {false, false};
-    struct Pend { long tick; bool push; };
+    struct Pend { long tick; bool push; float frac = 1.f; };
     std::deque<Pend> m_pend[2];        // events held back (only ever filled by a rescue)
     long m_arr[2] = {0, 0};            // arrival tick of the last held-back event
     long m_now = 0;                    // physics ticks started so far
@@ -147,6 +148,8 @@ private:
     std::unordered_map<int, MoveTrack> m_moveTrk;
     double m_clock = 0;                // game time = sum of the dt of every real physics step
     float m_stepDtNow = 0.f;
+    float m_dtScale = 1.f;             // ghost: part of a tick to simulate (sub-tick click)
+    bool m_partial = false;            // ghost: movement only, no collision check (first half of a split tick)
     // 2-player mode: which player the GAME really sends each side to (it depends on the
     // game's "flip 2-player controls" option). Learned from the real input, no settings read.
     int m_dbgFlag = -1;                // isPlayer1 of the last real input
@@ -842,13 +845,35 @@ private:
         }
         ++m_dbgDelayed;
         if (cfg().logEnabled) logRescue(pi, mode, po, d.delay);
-        pend.push_back({a + d.delay, push});
+        pend.push_back({a + d.delay, push, d.frac});
         m_arr[pi] = a;
         m_owed[pi] = true;
         return false;
     }
 
 public:
+
+    // ---- sub-tick click (CBF-like) -------------------------------------------------------
+    // The held-back click is due INSIDE the tick that is about to run: returns the part of the
+    // tick to run first (the hook then fires the click and runs the rest), 1 = no split.
+    float splitFor(PlayerObject* player) {
+        PlayLayer* pl = PlayLayer::get();
+        if (!pl || m_layout != Layout::Solo || player != pl->m_player1) return 1.f;
+        auto& pend = m_pend[0];
+        if (pend.empty()) return 1.f;
+        auto const& e = pend.front();
+        if (e.frac >= 1.f || e.tick != m_now + 1) return 1.f;
+        return std::clamp(e.frac, 0.03f, 0.97f);
+    }
+    void fireSplit() {
+        PlayLayer* pl = PlayLayer::get();
+        auto& pend = m_pend[0];
+        if (!pl || pend.empty()) return;
+        bool p = pend.front().push;
+        pend.pop_front();
+        fire(pl, 0, p);
+        if (pend.empty() && !m_supp[0]) m_owed[0] = false;
+    }
 
     // Called at the start of every physics tick of a player (real game only).
     // Player 1 drives it; player 2's update is only a backup heartbeat for the
@@ -1199,8 +1224,9 @@ private:
             if (m_tp == 0) b = nullptr;
             else a = nullptr;
         }
-        float dt = stepDt();
-        m_stepDtNow = dt;
+        float full = stepDt();
+        float dt = full * m_dtScale;
+        m_stepDtNow = full;
 
         bool wasHold = m_info[s].holding[m_tp];
         setHold(s, hold);
@@ -1233,16 +1259,20 @@ private:
             m_active = nullptr;
             return false;
         }
+        if (m_partial) {                  // first half of a split tick: the game checks collisions once, at the end
+            m_active = nullptr;
+            return true;
+        }
 
         if (a) {
             m_active = a;
             resetCollisionLog(a);
-            pl->checkCollisions(a, dt, false);
+            pl->checkCollisions(a, full, false);
         }
         if (!m_simDead && b) {
             m_active = b;
             resetCollisionLog(b);
-            pl->checkCollisions(b, dt, false);
+            pl->checkCollisions(b, full, false);
         }
         m_active = nullptr;
         if (m_simDead) return false;
@@ -1334,6 +1364,52 @@ private:
         }
     }
 
+    // ---- sub-tick search -------------------------------------------------------------
+    // A delay of d ticks works, d-1 does not: the real limit is somewhere inside tick d-1.
+    // Bisect it with the ghost (slot 2 = state at the start of that tick) and return the part of
+    // the tick after which the click can happen (1 = at the start of tick d, i.e. no gain).
+    // The tick limit (max delay) only bounds the search; the click itself goes where the ghost says.
+    bool trialSplit(bool click, int pi, int d, int h, int horizon, bool airMode, bool target, float f) {
+        copySlot(1, 2);
+        m_info[1].groundTicks = 0;
+        m_partial = true;
+        m_dtScale = f;
+        bool ok = step(1, m_game[pi]);                 // movement up to the click, no collision yet
+        m_partial = false;
+        if (ok) {
+            m_dtScale = 1.f - f;
+            ok = step(1, click ? true : target);       // rest of the tick WITH the click, collisions now
+        }
+        m_dtScale = 1.f;
+        if (!ok || m_aborted || m_info[1].unknown) return false;
+        if (click) {
+            int reach = d;
+            bool unk = false;
+            bool good = rollClick(1, d, std::max(0, h - 1), horizon, airMode, reach, unk);
+            return good && !unk && !m_aborted;
+        }
+        for (int t = d; t < horizon; ++t) {
+            if (!step(1, target)) return false;
+            if (m_info[1].unknown) return false;       // a delay must survive the whole look-ahead
+        }
+        return !m_aborted;
+    }
+
+    float refineFrac(bool click, int pi, int d, int h, int horizon, bool airMode, bool target) {
+        float lo = 0.f, hi = 1.f;                      // lo = fails, hi = works
+        for (int i = 0; i < 5; ++i) {
+            if (m_used + horizon + 4 > m_budget) break;
+            float mid = (lo + hi) * 0.5f;
+            if (trialSplit(click, pi, d, h, horizon, airMode, target, mid)) hi = mid;
+            else lo = mid;
+            if (m_aborted) {                           // out of budget: keep the whole-tick delay
+                m_aborted = false;
+                return 1.f;
+            }
+        }
+        return hi;
+    }
+
     Decision decideClick(PlayLayer* pl, Mode mode, int pi) {
         auto& c = cfg();
         Decision r;
@@ -1352,8 +1428,10 @@ private:
         // can be saved: the click goes through raw.
         int foundDelay = -1;
 
+        int foundHold = holds[0];
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
+                copySlot(2, 0);                  // state at the start of tick d-1 (for the sub-tick search)
                 if (!step(0, m_game[pi])) {
                     noteDeath(0);
                     break;                       // waiting longer is deadly too
@@ -1373,6 +1451,7 @@ private:
                 if (ok && unk && d > 0) ok = false;   // "cannot predict further" is no rescue
                 if (ok) {
                     foundDelay = d;
+                    foundHold = h;
                     if (m_wantTrail) m_trailOk = m_trail;
                     break;
                 }
@@ -1385,6 +1464,9 @@ private:
         if (foundDelay >= 0) {
             r.known = true;
             r.delay = foundDelay;
+            if (foundDelay > 0 && !m_aborted && c.subTick && m_layout == Layout::Solo) {
+                r.frac = refineFrac(true, pi, foundDelay, foundHold, horizon, airMode, false);
+            }
         } else if (c.dropFatal && !m_aborted) {
             // no delay saves it; dropping the click is the one rescue left (opt-in), and only
             // when NOT clicking survives
@@ -1427,6 +1509,7 @@ private:
 
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
+                copySlot(2, 0);                  // state at the start of tick d-1 (for the sub-tick search)
                 if (!step(0, m_game[pi])) {
                     noteDeath(0);
                     break;                       // waiting longer is deadly too
@@ -1468,6 +1551,9 @@ private:
         if (foundDelay > 0 && !m_aborted) {
             r.known = true;
             r.delay = foundDelay;
+            if (c.subTick && m_layout == Layout::Solo) {
+                r.frac = refineFrac(false, pi, foundDelay, 0, horizon, false, target);
+            }
         }   // else: fine right now, nothing saves it, or out of budget -> raw input
 
         ++m_dbgSearches;
