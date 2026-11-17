@@ -117,6 +117,9 @@ private:
     PlayerObject* m_active = nullptr;
     PlayerObject* m_stepObj[2] = {nullptr, nullptr};
     bool m_stepEdge[2] = {false, false};   // this tick presses the button (false -> true)
+    bool m_ringDone[2] = {false, false};   // an orb already reacted to this step's click
+    struct RingEntry { RingObject* obj; float x; };
+    std::vector<RingEntry> m_rings;        // every orb of the level, sorted by x (see buildRings)
 
     // search bookkeeping
     int m_used = 0;
@@ -253,6 +256,7 @@ public:
         for (int i = 0; i < kSlots; ++i) {
             if (!m_p[0][i]) m_ready = false;
         }
+        buildRings(pl);
         m_lastTickFrame = -1000;
         m_lastP1Frame = -1000;
         m_dbgIn[0] = m_dbgIn[1] = 0;
@@ -269,6 +273,44 @@ public:
         resetInput();
     }
 
+    // The ghost must not depend on the game handing it the orbs: every orb of the level is
+    // collected once, so a click is tested against the orbs around the ghost by geometry.
+    void buildRings(PlayLayer* pl) {
+        m_rings.clear();
+        if (!pl || !pl->m_objects) return;
+        for (auto* obj : geode::cocos::CCArrayExt<GameObject*>(pl->m_objects)) {
+            if (auto ring = geode::cast::typeinfo_cast<RingObject*>(obj)) {
+                m_rings.push_back({ring, ring->getPositionX()});
+            }
+        }
+        std::sort(m_rings.begin(), m_rings.end(), [](RingEntry const& a, RingEntry const& b) { return a.x < b.x; });
+    }
+
+    // Ghost, click tick: the orb that overlaps the player reacts (once per click), exactly like
+    // the game's own playerTouchedRing would, but found by geometry.
+    void simRingsByGeometry(PlayerObject* player, int who, CCRect const& pr) {
+        if (m_ringDone[who] || m_rings.empty()) return;
+        float px = pr.getMidX();
+        auto it = std::lower_bound(m_rings.begin(), m_rings.end(), px - 90.f,
+                                   [](RingEntry const& r, float v) { return r.x < v; });
+        for (; it != m_rings.end() && it->x <= px + 90.f; ++it) {
+            RingObject* ring = it->obj;
+            if (player->m_touchedRings.find(ring->m_uniqueID) != player->m_touchedRings.end()) continue;
+            CCRect rr = ring->getObjectRect();
+            float r = std::min(rr.size.width, rr.size.height) * 0.5f;
+            float cx = rr.getMidX(), cy = rr.getMidY();
+            float dx = cx - std::clamp(cx, pr.getMinX(), pr.getMaxX());
+            float dy = cy - std::clamp(cy, pr.getMinY(), pr.getMaxY());
+            if (dx * dx + dy * dy > r * r) continue;       // orbs are round
+            ++m_dbgRingSeen;
+            ++m_dbgRingHit;
+            m_ringDone[who] = true;
+            player->m_touchedRings.insert(ring->m_uniqueID);   // the game's own path must not fire it again
+            player->ringJump(ring, true);
+            break;
+        }
+    }
+
     void quit() {
         for (int pl = 0; pl < 2; ++pl) {
             for (int i = 0; i < kSlots; ++i) {
@@ -280,6 +322,7 @@ public:
             }
         }
         m_draw = nullptr; // owned by the layer
+        m_rings.clear();
         m_ready = false;
         m_simulating = false;
         m_active = nullptr;
@@ -388,6 +431,7 @@ public:
         if (!m_simulating || !pl || !isSimPlayer(player) || !vec) return;
         int who = player == m_stepObj[1] ? 1 : 0;
         CCRect pr = player->getObjectRect();
+        if (cfg().orbDetect && m_stepEdge[who]) simRingsByGeometry(player, who, pr);
         for (int i = 0; i < count; ++i) {
             GameObject* obj = vec->at(i);
             if (!obj) continue;
@@ -960,7 +1004,10 @@ public:
         int n = m_layout == Layout::Solo ? 1 : 2;
         m_justDecided = false;
         for (int pi = 0; pi < n; ++pi) tickPlayer(pl, pi);
-        if (cf.enabled && m_ready) reconcile(pl, n);
+        // The safety net also runs for a few ticks after dual ends while the mod is OFF: the game
+        // itself may keep a hold across the close portal (a wave stuck holding), and with the
+        // mod off nothing else would ever release it.
+        if (m_ready && (cf.enabled || m_sweep > 0)) reconcile(pl, n);
         if (!m_justDecided) overlayTick(pl);
     }
 
@@ -1234,6 +1281,7 @@ private:
         m_stepObj[0] = a;
         m_stepObj[1] = b;
         m_stepEdge[0] = m_stepEdge[1] = false;
+        m_ringDone[0] = m_ringDone[1] = false;
         m_stepEdge[m_tp] = hold && !wasHold;
         if (m_mirror) m_stepEdge[1] = m_stepEdge[0];
         m_curSlot = s;

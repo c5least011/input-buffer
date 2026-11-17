@@ -10,4 +10,5 @@ made it
 - fix some mini bugs
 # 1.1.2
 - add sub-tick delay that improve the accuracy
-
+# 1.1.3
+- fix the wave in dual keep holding when the mod is off
