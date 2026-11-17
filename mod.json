@@ -4,11 +4,7 @@
   "win": "2.2081",
   "android": "2.2081"
  },
-<<<<<<< HEAD
- "version": "v1.1.1",
-=======
  "version": "v1.1.2",
->>>>>>> 76b4fc4 (another random update)
  "id": "c5least.input-buffer",
  "name": "Input Buffer",
  "developer": "c5least",
