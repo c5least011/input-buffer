@@ -1417,7 +1417,8 @@ private:
     // Bisect it with the ghost (slot 2 = state at the start of that tick) and return the part of
     // the tick after which the click can happen (1 = at the start of tick d, i.e. no gain).
     // The tick limit (max delay) only bounds the search; the click itself goes where the ghost says.
-    bool trialSplit(bool click, int pi, int d, int h, int horizon, bool airMode, bool target, float f) {
+    bool trialSplit(bool click, int pi, int d, int h, int horizon, bool airMode, bool target, float f, bool groundMode) {
+        long ringsBefore = m_dbgRingHit;
         copySlot(1, 2);
         m_info[1].groundTicks = 0;
         m_partial = true;
@@ -1434,6 +1435,8 @@ private:
             int reach = d;
             bool unk = false;
             bool good = rollClick(1, d, std::max(0, h - 1), horizon, airMode, reach, unk);
+            // a ground mode only counts if the click really does something (jump from the ground, or an orb)
+            if (good && groundMode && !m_info[2].grounded && m_dbgRingHit == ringsBefore) return false;
             return good && !unk && !m_aborted;
         }
         for (int t = d; t < horizon; ++t) {
@@ -1443,12 +1446,12 @@ private:
         return !m_aborted;
     }
 
-    float refineFrac(bool click, int pi, int d, int h, int horizon, bool airMode, bool target) {
+    float refineFrac(bool click, int pi, int d, int h, int horizon, bool airMode, bool target, bool groundMode = false) {
         float lo = 0.f, hi = 1.f;                      // lo = fails, hi = works
         for (int i = 0; i < 5; ++i) {
             if (m_used + horizon + 4 > m_budget) break;
             float mid = (lo + hi) * 0.5f;
-            if (trialSplit(click, pi, d, h, horizon, airMode, target, mid)) hi = mid;
+            if (trialSplit(click, pi, d, h, horizon, airMode, target, mid, groundMode)) hi = mid;
             else lo = mid;
             if (m_aborted) {                           // out of budget: keep the whole-tick delay
                 m_aborted = false;
@@ -1465,6 +1468,9 @@ private:
         if (maxDelay <= 0) return r;
 
         bool airMode = mode == M_UFO || mode == M_SWING;
+        // Cube / ball / robot / spider only react to a click from the ground (or on an orb). A click in
+        // the air that merely "survives" is wasted, so for these the buffer waits for the landing.
+        bool groundMode = mode == M_CUBE || mode == M_BALL || mode == M_ROBOT || mode == M_SPIDER;
         int horizon = airMode ? std::min(c.trajectory, c.airHorizon) : c.trajectory;
         std::vector<int> holds = {c.tapTicks};
         if (mode == M_ROBOT) holds.push_back(std::max(c.tapTicks, c.robotHold));
@@ -1489,14 +1495,17 @@ private:
             }
             int reach = d;
             bool ok = false;
+            bool canAct = !groundMode || m_info[0].grounded;      // slot 0 = state at the start of tick d
             for (int h : holds) {
                 copySlot(1, 0);
                 m_info[1].groundTicks = 0;
                 size_t mark = m_trail.size();
                 trailPush(0, 1);
                 bool unk = false;
+                long ringsBefore = m_dbgRingHit;
                 ok = rollClick(1, d, h, horizon, airMode, reach, unk);
                 if (ok && unk && d > 0) ok = false;   // "cannot predict further" is no rescue
+                if (ok && !canAct && m_dbgRingHit == ringsBefore) ok = false;   // wasted click in the air
                 if (ok) {
                     foundDelay = d;
                     foundHold = h;
@@ -1513,7 +1522,7 @@ private:
             r.known = true;
             r.delay = foundDelay;
             if (foundDelay > 0 && !m_aborted && c.subTick && m_layout == Layout::Solo) {
-                r.frac = refineFrac(true, pi, foundDelay, foundHold, horizon, airMode, false);
+                r.frac = refineFrac(true, pi, foundDelay, foundHold, horizon, airMode, false, groundMode);
             }
         } else if (c.dropFatal && !m_aborted) {
             // no delay saves it; dropping the click is the one rescue left (opt-in), and only
