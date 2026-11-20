@@ -275,6 +275,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         if (track) g_engine.beginHandle();
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
         if (track) g_engine.endHandle(isPlayer1, down);      // learn which player the game gave it to
+        if (track) g_engine.endLate();                        // late rescue: the press is in, finish the rewind
     }
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {

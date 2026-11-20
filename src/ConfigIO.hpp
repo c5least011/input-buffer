@@ -47,7 +47,7 @@ inline std::vector<Key> const& keys() {
                     I{"shipLook", 4, 300, 36}, I{"waveLook", 4, 300, 24}}) {
             v.push_back({i.n, false, i.lo, i.hi, i.def});
         }
-        static constexpr int delays[M_COUNT] = {8, 12, 6, 6, 8, 6, 6, 6};
+        static constexpr int delays[M_COUNT] = {30, 12, 30, 6, 30, 30, 6, 6};
         for (int m = 0; m < M_COUNT; ++m) v.push_back({"maxDelay" + std::to_string(m), false, 0, 64, delays[m]});
         static constexpr int lates[M_COUNT] = {4, 4, 0, 4, 3, 0, 0, 0};
         for (int m = 0; m < M_COUNT; ++m) v.push_back({"maxLate" + std::to_string(m), false, 0, 12, lates[m]});

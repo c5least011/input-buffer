@@ -235,6 +235,11 @@ private:
     int m_histHead = 0;                          // newest entry
     int m_histN = 0;                             // valid entries
     int m_dbgLate = 0;
+    bool m_noOrb = false;                        // late search: orbs are ignored (the rescue never uses one)
+    int m_latePending = 0;                       // k of a rescue whose press is about to be delivered
+    int m_lateIdx = 0;                           // history entry the rescue starts from
+    Mode m_lateMode = M_CUBE;
+    std::vector<CCPoint> m_latePath;             // positions of the replayed ticks (wave trail)
 
     // Click Between Frames
     bool m_inUpdate = false;                     // player 1's update is running (CBF delivers clicks inside it)
@@ -458,7 +463,7 @@ public:
         if (!m_simulating || !pl || !isSimPlayer(player) || !vec) return;
         int who = player == m_stepObj[1] ? 1 : 0;
         CCRect pr = player->getObjectRect();
-        if (cfg().orbDetect && m_stepEdge[who]) simRingsByGeometry(player, who, pr);
+        if (cfg().orbDetect && !m_noOrb && m_stepEdge[who]) simRingsByGeometry(player, who, pr);
         for (int i = 0; i < count; ++i) {
             GameObject* obj = vec->at(i);
             if (!obj) continue;
@@ -489,7 +494,7 @@ public:
         if (player->m_touchedRings.find(ring->m_uniqueID) != player->m_touchedRings.end()) {
             return false;
         }
-        bool ok = cfg().orbDetect && m_stepEdge[player == m_stepObj[0] ? 0 : 1];
+        bool ok = cfg().orbDetect && !m_noOrb && m_stepEdge[player == m_stepObj[0] ? 0 : 1];
         if (ok) ++m_dbgRingHit;
         return ok;
     }
@@ -592,6 +597,7 @@ public:
     // Player 1's PlayerObject::update is running. A nested update (CBF calls it again for each
     // sub-step) is not a new tick, and a click delivered now lands inside the tick.
     bool inUpdate() const { return m_inUpdate; }
+    void endLate() { finishLate(); }
     void setInUpdate(bool v) { m_inUpdate = v; }
 
     // Real game: a move trigger just fired. For its duration the objects it moves are
@@ -927,7 +933,7 @@ private:
         m_otherOverride = -1;
         if (d.known && d.delay > 0 && m_dbgRingHit != ringBefore) ++m_dbgOrbDelays;
 
-        if (d.late > 0 && applyLate(pl, pi, po, mode, d.late)) {   // fatal now, safe k ticks ago: rewound
+        if (d.late > 0 && beginLate(pl, pi, po, mode, d.late)) {   // fatal now, safe k ticks ago: rewound
             m_game[pi] = push;
             return true;                                 // the press / release itself still goes through
         }
@@ -1563,6 +1569,21 @@ private:
                 trailPush(0, 1);
                 bool unk = false;
                 long ringsBefore = m_dbgRingHit;
+                if (groundMode && !canAct) {
+                    // In the air only an orb can make the click useful. Probing 2 ticks is enough to see
+                    // that, so a long fall does not cost a full look-ahead per tick (that used to eat
+                    // the whole budget and the click went through raw: no buffer at all).
+                    int r0 = d;
+                    bool u0 = false;
+                    bool probe = rollClick(1, d, h, d + 2, false, r0, u0);
+                    if (!probe || m_dbgRingHit == ringsBefore) {
+                        m_trail.resize(mark);
+                        if (m_aborted) break;
+                        continue;
+                    }
+                    copySlot(1, 0);
+                    m_info[1].groundTicks = 0;
+                }
                 ok = rollClick(1, d, h, horizon, airMode, reach, unk);
                 if (ok && unk && d > 0) {             // "cannot predict further" is no rescue
                     ok = false;
@@ -1693,6 +1714,7 @@ private:
         bool continuous = isContinuous(mode);
         bool wantTrail = m_wantTrail;
         m_wantTrail = false;                           // no trail for the late search
+        m_noOrb = true;                                // a rescue never uses an orb
         int found = 0;
         for (int k = 1; k <= maxK && !found; ++k) {
             int off = k - 1 + (m_inUpdate ? 1 : 0);
@@ -1701,25 +1723,29 @@ private:
             if (!m_hist[idx] || m_histMode[idx] != mode || m_histTick[idx] != m_now + nowOff - k) break;
 
             bool startGround = m_hist[idx]->m_isOnGround;
-            long ringsBefore = m_dbgRingHit;
+            // a click only counts when it does something: from the ground (never from an orb)
+            if (!continuous && !startGround) continue;
             loadHist(0, idx);
+            m_latePath.clear();
             bool alive = true;
             for (int t = 0; t < k && alive; ++t) {
                 bool hold = continuous ? target : t < c.tapTicks;      // a click is a tap, ship / wave keep the input
                 alive = step(0, hold);
                 if (alive && m_info[0].unknown) alive = false;          // something we cannot predict: no rewind
+                if (alive) m_latePath.push_back(m_p[0][0]->getPosition());
             }
             if (m_aborted) break;
             if (!alive) continue;
-            // a click from the ground (or on an orb) only counts when it does something
-            if (!continuous && !startGround && m_dbgRingHit == ringsBefore) continue;
 
             copySlot(kLateSlot, 0);                    // what the real player should look like right now
             if (continuous) {
                 copySlot(1, 0);
                 bool ok = true;
                 for (int t = 0; t < horizon && ok; ++t) ok = step(1, target) && !m_info[1].unknown;
-                if (ok && !m_aborted) found = k;
+                if (ok && !m_aborted) {
+                    found = k;
+                    m_lateIdx = idx;
+                }
             } else {
                 for (int h : holds) {
                     copySlot(1, 0);
@@ -1729,6 +1755,7 @@ private:
                     bool ok = rollClick(1, 0, std::max(0, h - k), horizon, false, reach, unk);
                     if (ok && !unk && !m_aborted) {
                         found = k;
+                        m_lateIdx = idx;
                         break;
                     }
                     if (m_aborted) break;
@@ -1737,19 +1764,14 @@ private:
             if (m_aborted) break;
         }
         m_wantTrail = wantTrail;
+        m_noOrb = false;
         return found;
     }
 
-    // The real player takes over the replayed state. The press / release itself is delivered by the
-    // caller right after (it only sets the hold: the impulse already happened in the replay).
-    bool applyLate(PlayLayer* pl, int pi, PlayerObject* po, Mode mode, int k) {
-        PlayerObject* g = m_p[0][kLateSlot];
-        if (pi != 0 || !g || !po || po != pl->m_player1 || po->m_isDead || m_simulating) return false;
-        bool visible = po->isVisible();
-        po->copyAttributes(g);
-        po->setVisible(visible);
+    // Physics only: no copyAttributes, no rotation, no visibility. Those reset the icon's animation
+    // (jump rotation, robot / spider frames), which looked stiff.
+    void copyPhysics(PlayerObject* po, PlayerObject* g) {
         po->setPosition(g->getPosition());
-        po->setRotation(g->getRotation());
         po->m_gravityMod = g->m_gravityMod;
         po->m_isOnGround = g->m_isOnGround;
         po->m_isUpsideDown = g->m_isUpsideDown;
@@ -1762,6 +1784,42 @@ private:
         po->m_touchedRings = g->m_touchedRings;
         if (po->m_touchingRings) po->m_touchingRings->removeAllObjects();
         resetCollisionLog(po);
+    }
+
+    // Phase 1 (called by rescue(), before the press is delivered): put the real player back at the
+    // state k ticks ago. The game then handles the press itself, on the ground, so the jump / its
+    // animation really start (a press in the air would not play them).
+    bool beginLate(PlayLayer* pl, int pi, PlayerObject* po, Mode mode, int k) {
+        PlayerObject* h = m_hist[m_lateIdx];
+        if (pi != 0 || !h || !m_p[0][kLateSlot] || !po || po != pl->m_player1 || po->m_isDead || m_simulating) return false;
+        copyPhysics(po, h);
+        m_latePending = k;
+        m_lateMode = mode;
+        return true;
+    }
+
+    // Phase 2 (hook, right after the press was delivered): the real player takes over the replayed
+    // state, and the wave trail is redrawn along the replayed path instead of being dragged.
+    void finishLate() {
+        if (m_latePending <= 0) return;
+        int k = m_latePending;
+        m_latePending = 0;
+        PlayLayer* pl = PlayLayer::get();
+        PlayerObject* po = pl ? pl->m_player1 : nullptr;
+        PlayerObject* g = m_p[0][kLateSlot];
+        PlayerObject* h = m_hist[m_lateIdx];
+        if (!po || !g || !h || po->m_isDead) return;
+        float startX = h->getPositionX();
+        copyPhysics(po, g);
+        if (m_lateMode == M_WAVE && po->m_waveTrail && po->m_waveTrail->m_pointArray) {
+            auto* arr = po->m_waveTrail->m_pointArray;
+            for (int i = static_cast<int>(arr->count()) - 1; i >= 0; --i) {
+                auto* node = static_cast<PointNode*>(arr->objectAtIndex(i));
+                if (node && node->m_point.x > startX + 0.001f) arr->removeObjectAtIndex(i);
+                else break;                                // points are in order: the rest is older
+            }
+            for (auto const& pt : m_latePath) po->m_waveTrail->addPoint(pt);
+        }
         m_histN = 0;                                   // the stored states are of the old timeline
         ++m_dbgLate;
         m_lastText = fmt::format("P1 LATE rescue: moved back {} ticks", k);
@@ -1770,11 +1828,10 @@ private:
             m_log.push_back(fmt::format(
                 "TPS {:.0f} | FPS {:.0f} | LATE saved {}t | {:.1f}ms | {}{}",
                 tps, effectiveFps(), k, tps > 0.f ? static_cast<float>(k) * 1000.f / tps : 0.f,
-                kModeNames[mode], cbfActive() ? " | CBF" : ""
+                kModeNames[m_lateMode], cbfActive() ? " | CBF" : ""
             ));
             while (static_cast<int>(m_log.size()) > kLogMax) m_log.pop_front();
         }
-        return true;
     }
 
     // ========================================================= ship / wave

@@ -14,6 +14,7 @@ made it
 - fix the wave in dual keep holding when the mod is off
 # 1.1.4
 - fix some gamemodes don't buffer correctly
-# 1.1.5
+# 1.1.5 beta
 - improve cbf
 - input buffer now save late click [test]
+- fix bugs on cube

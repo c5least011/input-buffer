@@ -70,7 +70,8 @@ struct Config {
     int trajectory = 120;               // lookahead (ticks) for click-style modes
 
     // per mode: max ticks a press / release may be held back. 0 = mode off.
-    int maxDelay[M_COUNT] = {8, 12, 6, 6, 8, 6, 6, 6};
+    // ground modes wait for the landing, so they need a long window (a jump lasts far more than 8 ticks)
+    int maxDelay[M_COUNT] = {30, 12, 30, 6, 30, 30, 6, 6};
 
     // per mode: max ticks a LATE press / release may be moved back in time (0 = off).
     // Only cube, ship, wave and robot are supported: for the other modes a second press
@@ -173,6 +174,13 @@ inline void loadConfig() {
     for (int i = 0; i < M_COUNT; ++i) {
         c.maxDelay[i] = gi((std::string("maxDelay") + std::to_string(i)).c_str(), d.maxDelay[i], 0, 64);
     }
+    if (m->getSavedValue<int64_t>("cfgVersion", 0) < 4) {
+        // v4: ground modes got a much longer default delay; only values still at the old default move
+        static constexpr int oldDelay[M_COUNT] = {8, 12, 6, 6, 8, 6, 6, 6};
+        for (int i : {int(M_CUBE), int(M_BALL), int(M_ROBOT), int(M_SPIDER)}) {
+            if (c.maxDelay[i] == oldDelay[i]) c.maxDelay[i] = d.maxDelay[i];
+        }
+    }
     for (int i = 0; i < M_COUNT; ++i) {
         c.maxLate[i] = gi((std::string("maxLate") + std::to_string(i)).c_str(), d.maxLate[i], 0, 12);
     }
@@ -182,12 +190,13 @@ inline void loadConfig() {
     c.budget = gi("budget", 3000, 200, 40000);
     c.shipHorizon = gi("shipLook", 36, 4, 300);
     c.waveHorizon = gi("waveLook", 24, 4, 300);
+    if (m->getSavedValue<int64_t>("cfgVersion", 0) < 4) saveConfig();   // after everything is loaded
 }
 
 inline void saveConfig() {
     auto* m = geode::Mod::get();
     auto& c = cfg();
-    m->setSavedValue<int64_t>("cfgVersion", 3);
+    m->setSavedValue<int64_t>("cfgVersion", 4);
     m->setSavedValue<bool>("enabled", c.enabled);
     m->setSavedValue<bool>("showTraj", c.showTrajectory);
     m->setSavedValue<bool>("logOn", c.logEnabled);
