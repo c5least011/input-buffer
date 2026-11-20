@@ -424,8 +424,7 @@ public:
     }
 
     void onReset() { // level restart / respawn
-        m_histN = 0;
-        clearFx();
+        m_histN = 0;           // (the saved marks stay: a death is not a restart, see resetMarks)
         for (int i = 0; i < 2; ++i) {
             m_pend[i].clear();
             m_supp[i] = false;
@@ -630,6 +629,7 @@ public:
     // Player 1's PlayerObject::update is running. A nested update (CBF calls it again for each
     // sub-step) is not a new tick, and a click delivered now lands inside the tick.
     bool inUpdate() const { return m_inUpdate; }
+    void resetMarks() { clearFx(); }   // level restart: the saved marks go
     void endLate() { finishLate(); }
     void setInUpdate(bool v) { m_inUpdate = v; }
 
@@ -1233,15 +1233,14 @@ private:
 
     void redrawFx(std::vector<CCPoint> const& pts) {
         m_fxDraw->clear();
-        constexpr float r = 13.f;
-        constexpr int n = 28;
+        constexpr float r = 6.5f;
+        constexpr int n = 24;
         for (auto const& c : pts) {
-            m_fxDraw->drawDot(c, r, {0.f, 0.f, 0.f, 0.6f});
             CCPoint prev = ccp(c.x + r, c.y);
             for (int i = 1; i <= n; ++i) {
                 float ang = 6.2831853f * static_cast<float>(i) / static_cast<float>(n);
                 CCPoint cur = ccp(c.x + r * std::cos(ang), c.y + r * std::sin(ang));
-                m_fxDraw->drawSegment(prev, cur, 1.2f, {1.f, 1.f, 1.f, 0.95f});
+                m_fxDraw->drawSegment(prev, cur, 1.4f, {1.f, 1.f, 1.f, 0.95f});
                 prev = cur;
             }
         }
@@ -1254,9 +1253,9 @@ private:
         m_fxPts.push_back(at);
         auto* label = CCLabelBMFont::create(fmt::format("{:+d}", ticks).c_str(), "chatFont.fnt");
         if (label) {
-            label->setScale(0.45f);
+            label->setScale(0.9f);
             label->setAnchorPoint({0.f, 0.5f});
-            label->setPosition(ccp(at.x + 17.f, at.y));
+            label->setPosition(ccp(at.x + 11.f, at.y));
             label->setZOrder(5002);
             pl->m_objectLayer->addChild(label);
             m_fxLabels.push_back(label);

@@ -60,6 +60,7 @@ class $modify(BufPlayLayer, PlayLayer) {
 
     void resetLevel() {
         g_engine.onReset();
+        g_engine.resetMarks();
         PlayLayer::resetLevel();
     }
 
