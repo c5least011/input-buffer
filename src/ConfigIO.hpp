@@ -28,7 +28,7 @@ inline std::vector<Key> const& keys() {
         for (B b : {B{"enabled", 1}, B{"showTraj", 1}, B{"logOn", 0}, B{"dualOn", 1}, B{"bothSides", 1},
                     B{"previewBoth", 1}, B{"showPath", 0}, B{"orbDetect", 1}, B{"dropFatal", 0},
                     B{"twoPlayerOn", 1}, B{"moveDetect", 1}, B{"swapTwoP", 1}, B{"waveAnglesOn", 0},
-                    B{"autoplay", 0}, B{"autoLearn", 1}, B{"autoKeep", 0}, B{"subTick", 1}}) {
+                    B{"autoplay", 0}, B{"autoLearn", 1}, B{"autoKeep", 0}, B{"subTick", 1}, B{"cbfOn", 1}, B{"lateOn", 1}}) {
             v.push_back({b.n, true, 0, 1, b.def});
         }
         struct I { char const* n; int lo; int hi; int def; };
@@ -49,6 +49,8 @@ inline std::vector<Key> const& keys() {
         }
         static constexpr int delays[M_COUNT] = {8, 12, 6, 6, 8, 6, 6, 6};
         for (int m = 0; m < M_COUNT; ++m) v.push_back({"maxDelay" + std::to_string(m), false, 0, 64, delays[m]});
+        static constexpr int lates[M_COUNT] = {4, 4, 0, 4, 3, 0, 0, 0};
+        for (int m = 0; m < M_COUNT; ++m) v.push_back({"maxLate" + std::to_string(m), false, 0, 12, lates[m]});
         return v;
     }();
     return k;

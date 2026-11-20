@@ -516,9 +516,12 @@ protected:
                     std::string(kModeNames[i]) + " max delay", &c.maxDelay[i], 0, 64
                 ));
             }
-            note = "Max ticks a press / release may be held back (0 = mode off).\n"
-                   "Ship/Wave only act when holding or releasing NOW would kill you\n"
-                   "within 'imminent' ticks and waiting pushes it back by 'min gain'.";
+            items.push_back(number("Cube late rescue", &c.maxLate[M_CUBE], 0, 12));
+            items.push_back(number("Ship late rescue", &c.maxLate[M_SHIP], 0, 12));
+            items.push_back(number("Wave late rescue", &c.maxLate[M_WAVE], 0, 12));
+            items.push_back(number("Robot late rescue", &c.maxLate[M_ROBOT], 0, 12));
+            note = "Max delay: ticks an EARLY press / release may be held back (0 = mode off).\n"
+                   "Late rescue: ticks a LATE press / release may be moved back in time (0 = off).";
         } else if (tab == 2) {
             items = {
                 number("TPS (0 = auto)", &c.tps, 0, 10000),
@@ -530,11 +533,13 @@ protected:
                 number("Mini up (1/100 deg)", &c.miniUp, 3000, 8500),
                 number("Mini down (1/100 deg)", &c.miniDown, 3000, 8500),
             };
-            note = g_engine.timingInfo() + (Engine::cbfLoaded() ? "\nClick Between Frames: detected" : "\nClick Between Frames: not found") +
+            note = g_engine.timingInfo() + (g_engine.cbfActive() ? "\nClick Between Frames: active" : (Engine::cbfLoaded() ? "\nClick Between Frames: loaded (off)" : "\nClick Between Frames: not found")) +
                    "\n" + g_engine.orbInfo() +
                    "\nWave angles: ghost wave follows these slopes (4510 = 45.10 deg).";
         } else if (tab == 3) {
             items = {
+                toggle("Late click rescue", &c.lateRescue),
+                toggle("CBF support", &c.cbfSupport),
                 number("Ship look (ticks)", &c.shipHorizon, 4, 300),
                 number("Wave look (ticks)", &c.waveHorizon, 4, 300),
                 number("Landing settle (ticks)", &c.settle, 1, 30),
@@ -545,7 +550,8 @@ protected:
                 number("Fail-open frames", &c.failOpen, 1, 60),
             };
             note = "Ship/Wave look: a hold/release must survive this many ticks.\n"
-                   "If no delay saves it, the input goes through raw.";
+                   "If no delay saves it, a late rescue is tried, else the input goes through raw.\n"
+                   "CBF support: with Click Between Frames on, it splits the steps (own sub-tick is off).";
         } else if (tab == 5) {
             items = {
                 toggle("Autoplay", &c.autoplay),

@@ -160,6 +160,9 @@ class $modify(BufPlayerObject, PlayerObject) {
         (void)self.setHookPriority("PlayerObject::playSpiderDashEffect", -1000000);
         (void)self.setHookPriority("PlayerObject::incrementJumps", -1000000);
         (void)self.setHookPriority("PlayerObject::ringJump", -1000000);
+        // outermost: Click Between Frames splits the step INSIDE its own update hook. This hook then
+        // sees one call per physics tick and CBF's sub-steps run below it.
+        (void)self.setHookPriority("PlayerObject::update", -1000000);
     }
 
     void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
@@ -183,21 +186,31 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     void update(float dt) {
+        PlayLayer* pl = PlayLayer::get();
+        bool real = pl && !g_engine.isSimulating();
+        if (real && g_engine.inUpdate()) {
+            // nested call (CBF updates the players again for each sub-step of the tick): not a new tick
+            PlayerObject::update(dt);
+            return;
+        }
         float split = 1.f;
-        if (PlayLayer::get() && !g_engine.isSimulating()) {
+        if (real) {
             g_engine.setFrameDelta(dt);
             g_engine.addClock(this, dt);
             g_engine.onTick(this);
-            split = g_engine.splitFor(this);
+            split = g_engine.splitFor(this);            // always 1 while CBF is active
         }
+        bool track = real && this == pl->m_player1;
+        if (track) g_engine.setInUpdate(true);          // clicks delivered from here land inside the tick
         if (split < 1.f) {
-            // sub-tick click (CBF-like): run the first part of the tick, click, run the rest
+            // sub-tick click (own CBF-like split): run the first part of the tick, click, run the rest
             PlayerObject::update(dt * split);
             g_engine.fireSplit();
             PlayerObject::update(dt * (1.f - split));
-            return;
+        } else {
+            PlayerObject::update(dt);
         }
-        PlayerObject::update(dt);
+        if (track) g_engine.setInUpdate(false);
     }
 
     void ringJump(RingObject* p0, bool p1) {

@@ -42,7 +42,13 @@ namespace buf {
 //    click), gravity portals and speed portals. Anything else it cannot
 //    predict (pads, mode / size / mirror / dual / teleport portals) ends the
 //    prediction there: it counts as survived instead of guessing.
-//  * No autopilot: the engine only ever delays what you pressed or released.
+//  * No autopilot: the engine only ever delays what you pressed or released, or (late rescue)
+//    moves a press / release that would be fatal a few ticks BACK in time: the ghost replays
+//    those ticks from a stored state with the input applied, and the real player takes over
+//    the replayed state.
+//  * Click Between Frames: CBF splits the physics step itself (inside PlayerObject::update).
+//    While it is active this engine never splits a tick on its own, counts a tick once (the
+//    nested sub-step updates are ignored, see inUpdate()) and uses CBF's exact click time.
 // ---------------------------------------------------------------------------
 class Engine {
 public:
@@ -55,6 +61,8 @@ public:
         int delay = 0;        // ticks to hold the event back
         bool drop = false;    // swallow the click entirely
         float frac = 1.f;     // 1 = at the start of tick `delay`; < 1 = inside the tick before, after this part of it
+        bool doomed = false;  // no delay survives and the prediction is reliable (late rescue may be tried)
+        int late = 0;         // > 0: the input would have been safe this many ticks earlier (state in the late slot)
     };
 
 private:
@@ -217,6 +225,22 @@ private:
     float m_measuredDt = 0.25f;
     CCDrawNode* m_draw = nullptr;
 
+    // late-click rescue: state of player 1 at the start of the last kHist ticks (ghost copies)
+    static constexpr int kHist = 12;
+    static constexpr int kLateSlot = 3;          // ghost slot that holds the state to hand to the real player
+    PlayerObject* m_hist[kHist] = {};
+    bool m_histHold[kHist] = {};                 // hold state the game had when that tick started
+    long m_histTick[kHist] = {};
+    Mode m_histMode[kHist] = {};
+    int m_histHead = 0;                          // newest entry
+    int m_histN = 0;                             // valid entries
+    int m_dbgLate = 0;
+
+    // Click Between Frames
+    bool m_inUpdate = false;                     // player 1's update is running (CBF delivers clicks inside it)
+    bool m_cbfOn = false;
+    int m_cbfFrame = -1000;
+
     // wave slope tracking (HUD)
     float m_prevX = 0.f;
     float m_prevY = 0.f;
@@ -321,9 +345,11 @@ public:
                 }
             }
         }
+        destroyHist();
         m_draw = nullptr; // owned by the layer
         m_rings.clear();
         m_ready = false;
+        m_inUpdate = false;
         m_simulating = false;
         m_active = nullptr;
         resetInput();
@@ -341,6 +367,7 @@ public:
     }
 
     void onReset() { // level restart / respawn
+        m_histN = 0;
         for (int i = 0; i < 2; ++i) {
             m_pend[i].clear();
             m_supp[i] = false;
@@ -546,6 +573,26 @@ public:
     static bool cbfLoaded() {
         return Loader::get()->isModLoaded("syzzi.click_between_frames");
     }
+
+    // CBF loaded, enabled and not switched off by its own "soft-toggle" setting.
+    // Cached for a few frames: this is asked on the physics hot path.
+    bool cbfActive() {
+        if (!cfg().cbfSupport) return false;
+        int fr = static_cast<int>(CCDirector::sharedDirector()->getTotalFrames());
+        int since = fr - m_cbfFrame;
+        if (since >= 0 && since < 30) return m_cbfOn;      // refreshed every 30 frames
+        m_cbfFrame = fr;
+        m_cbfOn = false;
+        if (auto* m = Loader::get()->getLoadedMod("syzzi.click_between_frames")) {
+            m_cbfOn = m->isLoaded() && !(m->hasSetting("soft-toggle") && m->getSettingValue<bool>("soft-toggle"));
+        }
+        return m_cbfOn;
+    }
+
+    // Player 1's PlayerObject::update is running. A nested update (CBF calls it again for each
+    // sub-step) is not a new tick, and a click delivered now lands inside the tick.
+    bool inUpdate() const { return m_inUpdate; }
+    void setInUpdate(bool v) { m_inUpdate = v; }
 
     // Real game: a move trigger just fired. For its duration the objects it moves are
     // not where the ghost sees them, so the prediction must not be trusted near them.
@@ -857,7 +904,9 @@ private:
             return false;
         }
 
-        long a = m_now + 1;                         // index of the next tick
+        // vanilla: the click is handled before the next tick. CBF: it is delivered inside the tick
+        // that is running (that tick has already been counted).
+        long a = m_now + (m_inUpdate ? 0 : 1);
         if (!pend.empty()) {
             // an earlier event is still being held back: stay behind it and keep
             // the spacing you had (no new search, nothing is "re-decided")
@@ -878,6 +927,10 @@ private:
         m_otherOverride = -1;
         if (d.known && d.delay > 0 && m_dbgRingHit != ringBefore) ++m_dbgOrbDelays;
 
+        if (d.late > 0 && applyLate(pl, pi, po, mode, d.late)) {   // fatal now, safe k ticks ago: rewound
+            m_game[pi] = push;
+            return true;                                 // the press / release itself still goes through
+        }
         if (!d.known || (!d.drop && d.delay == 0)) {    // not early: let it through
             m_game[pi] = push;
             return true;
@@ -903,6 +956,7 @@ public:
     float splitFor(PlayerObject* player) {
         PlayLayer* pl = PlayLayer::get();
         if (!pl || m_layout != Layout::Solo || player != pl->m_player1) return 1.f;
+        if (cbfActive()) return 1.f;                 // CBF splits the step; two updates would eat its queue
         auto& pend = m_pend[0];
         if (pend.empty()) return 1.f;
         auto const& e = pend.front();
@@ -979,6 +1033,8 @@ public:
             m_keepFail.clear();
             drawResult();
         }
+
+        histPush(pl);
 
         bool autoOn = cf.autoplay && m_ready && m_layout != Layout::TwoPlayer &&
                       pl->m_player1 && !pl->m_player1->m_isDead;
@@ -1483,6 +1539,7 @@ private:
         int foundDelay = -1;
 
         int foundHold = holds[0];
+        bool sawUnknown = false;                 // the prediction ended on something it cannot predict
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
                 copySlot(2, 0);                  // state at the start of tick d-1 (for the sub-tick search)
@@ -1491,7 +1548,10 @@ private:
                     break;                       // waiting longer is deadly too
                 }
                 trailPush(0, 0);
-                if (m_info[0].unknown) break;    // cannot predict any further
+                if (m_info[0].unknown) {         // cannot predict any further
+                    sawUnknown = true;
+                    break;
+                }
             }
             int reach = d;
             bool ok = false;
@@ -1504,7 +1564,10 @@ private:
                 bool unk = false;
                 long ringsBefore = m_dbgRingHit;
                 ok = rollClick(1, d, h, horizon, airMode, reach, unk);
-                if (ok && unk && d > 0) ok = false;   // "cannot predict further" is no rescue
+                if (ok && unk && d > 0) {             // "cannot predict further" is no rescue
+                    ok = false;
+                    sawUnknown = true;
+                }
                 if (ok && !canAct && m_dbgRingHit == ringsBefore) ok = false;   // wasted click in the air
                 if (ok) {
                     foundDelay = d;
@@ -1521,29 +1584,197 @@ private:
         if (foundDelay >= 0) {
             r.known = true;
             r.delay = foundDelay;
-            if (foundDelay > 0 && !m_aborted && c.subTick && m_layout == Layout::Solo) {
+            if (foundDelay > 0 && !m_aborted && c.subTick && m_layout == Layout::Solo && !cbfActive()) {
                 r.frac = refineFrac(true, pi, foundDelay, foundHold, horizon, airMode, false, groundMode);
             }
-        } else if (c.dropFatal && !m_aborted) {
-            // no delay saves it; dropping the click is the one rescue left (opt-in), and only
-            // when NOT clicking survives
-            loadReal(0);
-            bool alive = true;
-            for (int t = 0; t < horizon && alive; ++t) alive = step(0, m_game[pi]);
-            if (alive && !m_aborted) {
-                r.known = true;
-                r.drop = true;
+        } else {
+            // no delay saves it. Moving the click back in time comes first, dropping it is the one
+            // rescue left (opt-in, and only when NOT clicking survives)
+            if (!m_aborted && !sawUnknown) {
+                r.doomed = true;
+                r.late = lateSearch(pl, mode, pi, true, holds, horizon);
+            }
+            if (r.late == 0 && c.dropFatal && !m_aborted) {
+                loadReal(0);
+                bool alive = true;
+                for (int t = 0; t < horizon && alive; ++t) alive = step(0, m_game[pi]);
+                if (alive && !m_aborted) {
+                    r.known = true;
+                    r.drop = true;
+                }
             }
         }   // else: nothing saves it -> raw click
 
         ++m_dbgSearches;
         m_lastText = fmt::format(
             "P{} click d={} {} used={}{}",
-            pi + 1, r.delay, foundDelay >= 0 ? "SAFE" : (r.drop ? "DROP" : "raw"),
+            pi + 1, r.delay, foundDelay >= 0 ? "SAFE" : (r.late > 0 ? "LATE" : (r.drop ? "DROP" : "raw")),
             m_used, m_aborted ? " ABORT" : ""
         );
         endSearch();
         return r;
+    }
+
+    // ======================================================= late-click rescue
+    // A press / release that arrives too late: doing it NOW is fatal and no delay helps. The state of
+    // player 1 at the start of each of the last ticks is kept (ghost copies). For k = 1, 2, ... the
+    // ghost replays k ticks from there WITH the input applied and checks that the run then survives.
+    // The smallest k that does wins and the real player takes over the replayed state (applyLate),
+    // as if the input had come k ticks earlier. Cube, ship, wave and robot only: a second press in
+    // the air would repeat the impulse of UFO / swing / ball / spider.
+    static bool lateMode(Mode m) { return m == M_CUBE || m == M_SHIP || m == M_WAVE || m == M_ROBOT; }
+
+    void destroyHist() {
+        for (int i = 0; i < kHist; ++i) {
+            if (m_hist[i]) {
+                m_hist[i]->removeFromParent();
+                m_hist[i]->release();
+                m_hist[i] = nullptr;
+            }
+        }
+        m_histN = 0;
+        m_histHead = 0;
+    }
+
+    bool ensureHist(PlayLayer* pl) {
+        if (m_hist[0]) return true;
+        for (int i = 0; i < kHist; ++i) {
+            m_hist[i] = createSimPlayer(pl);
+            if (!m_hist[i]) {
+                destroyHist();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // start of every real tick, before held-back events fire: remember player 1
+    void histPush(PlayLayer* pl) {
+        auto& c = cfg();
+        PlayerObject* p1 = pl->m_player1;
+        if (!c.lateRescue || !m_ready || m_layout != Layout::Solo || !p1 || p1->m_isDead) {
+            m_histN = 0;
+            return;
+        }
+        Mode mode = detectMode(p1);
+        if (!lateMode(mode) || c.maxLate[mode] <= 0 || !ensureHist(pl)) {
+            m_histN = 0;
+            return;
+        }
+        // older states do not apply after a vehicle change or a gap in the ticks
+        if (m_histN > 0 && (m_histMode[m_histHead] != mode || m_histTick[m_histHead] != m_now - 1)) m_histN = 0;
+        m_histHead = (m_histHead + 1) % kHist;
+        syncPlayer(m_hist[m_histHead], p1);
+        m_histHold[m_histHead] = m_game[0];
+        m_histTick[m_histHead] = m_now;
+        m_histMode[m_histHead] = mode;
+        if (m_histN < kHist) ++m_histN;
+    }
+
+    void loadHist(int s, int idx) {
+        syncPlayer(m_p[0][s], m_hist[idx]);
+        m_info[s] = SlotInfo();
+        m_info[s].grounded = m_p[0][s]->m_isOnGround;
+        m_info[s].groundTicks = m_info[s].grounded ? 1 : 0;
+        forceHoldObj(s, 0, m_histHold[idx]);
+    }
+
+    // Called inside a decide*() search (beginSearch already ran). Returns k > 0 when the input would
+    // have been safe k ticks ago; the state the real player should be in is then in kLateSlot.
+    int lateSearch(PlayLayer* pl, Mode mode, int pi, bool target, std::vector<int> const& holds, int horizon) {
+        (void)pl;
+        auto& c = cfg();
+        if (!c.lateRescue || pi != 0 || m_two || m_layout != Layout::Solo || !lateMode(mode)) return 0;
+        int maxK = std::min(c.maxLate[mode], kHist);
+        if (maxK <= 0 || m_histN <= 0) return 0;
+
+        // vanilla: the real player stands at the start of tick m_now + 1. CBF: inside tick m_now.
+        int nowOff = m_inUpdate ? 0 : 1;
+        bool continuous = isContinuous(mode);
+        bool wantTrail = m_wantTrail;
+        m_wantTrail = false;                           // no trail for the late search
+        int found = 0;
+        for (int k = 1; k <= maxK && !found; ++k) {
+            int off = k - 1 + (m_inUpdate ? 1 : 0);
+            if (off >= m_histN) break;
+            int idx = ((m_histHead - off) % kHist + kHist) % kHist;
+            if (!m_hist[idx] || m_histMode[idx] != mode || m_histTick[idx] != m_now + nowOff - k) break;
+
+            bool startGround = m_hist[idx]->m_isOnGround;
+            long ringsBefore = m_dbgRingHit;
+            loadHist(0, idx);
+            bool alive = true;
+            for (int t = 0; t < k && alive; ++t) {
+                bool hold = continuous ? target : t < c.tapTicks;      // a click is a tap, ship / wave keep the input
+                alive = step(0, hold);
+                if (alive && m_info[0].unknown) alive = false;          // something we cannot predict: no rewind
+            }
+            if (m_aborted) break;
+            if (!alive) continue;
+            // a click from the ground (or on an orb) only counts when it does something
+            if (!continuous && !startGround && m_dbgRingHit == ringsBefore) continue;
+
+            copySlot(kLateSlot, 0);                    // what the real player should look like right now
+            if (continuous) {
+                copySlot(1, 0);
+                bool ok = true;
+                for (int t = 0; t < horizon && ok; ++t) ok = step(1, target) && !m_info[1].unknown;
+                if (ok && !m_aborted) found = k;
+            } else {
+                for (int h : holds) {
+                    copySlot(1, 0);
+                    m_info[1].groundTicks = 0;
+                    int reach = 0;
+                    bool unk = false;
+                    bool ok = rollClick(1, 0, std::max(0, h - k), horizon, false, reach, unk);
+                    if (ok && !unk && !m_aborted) {
+                        found = k;
+                        break;
+                    }
+                    if (m_aborted) break;
+                }
+            }
+            if (m_aborted) break;
+        }
+        m_wantTrail = wantTrail;
+        return found;
+    }
+
+    // The real player takes over the replayed state. The press / release itself is delivered by the
+    // caller right after (it only sets the hold: the impulse already happened in the replay).
+    bool applyLate(PlayLayer* pl, int pi, PlayerObject* po, Mode mode, int k) {
+        PlayerObject* g = m_p[0][kLateSlot];
+        if (pi != 0 || !g || !po || po != pl->m_player1 || po->m_isDead || m_simulating) return false;
+        bool visible = po->isVisible();
+        po->copyAttributes(g);
+        po->setVisible(visible);
+        po->setPosition(g->getPosition());
+        po->setRotation(g->getRotation());
+        po->m_gravityMod = g->m_gravityMod;
+        po->m_isOnGround = g->m_isOnGround;
+        po->m_isUpsideDown = g->m_isUpsideDown;
+        po->m_vehicleSize = g->m_vehicleSize;
+        po->m_playerSpeed = g->m_playerSpeed;
+        po->m_yVelocity = g->m_yVelocity;
+        po->m_gravity = g->m_gravity;
+        po->m_speedMultiplier = g->m_speedMultiplier;
+        po->m_lastPosition = g->m_lastPosition;
+        po->m_touchedRings = g->m_touchedRings;
+        if (po->m_touchingRings) po->m_touchingRings->removeAllObjects();
+        resetCollisionLog(po);
+        m_histN = 0;                                   // the stored states are of the old timeline
+        ++m_dbgLate;
+        m_lastText = fmt::format("P1 LATE rescue: moved back {} ticks", k);
+        if (cfg().logEnabled) {
+            float tps = effectiveTps();
+            m_log.push_back(fmt::format(
+                "TPS {:.0f} | FPS {:.0f} | LATE saved {}t | {:.1f}ms | {}{}",
+                tps, effectiveFps(), k, tps > 0.f ? static_cast<float>(k) * 1000.f / tps : 0.f,
+                kModeNames[mode], cbfActive() ? " | CBF" : ""
+            ));
+            while (static_cast<int>(m_log.size()) > kLogMax) m_log.pop_front();
+        }
+        return true;
     }
 
     // ========================================================= ship / wave
@@ -1563,6 +1794,7 @@ private:
 
         int foundDelay = -1;
         int firstReach = -1;
+        bool sawUnknown = false;                 // the prediction ended on something it cannot predict
 
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
@@ -1572,7 +1804,10 @@ private:
                     break;                       // waiting longer is deadly too
                 }
                 trailPush(0, 0);
-                if (m_info[0].unknown) break;    // cannot predict any further
+                if (m_info[0].unknown) {         // cannot predict any further
+                    sawUnknown = true;
+                    break;
+                }
             }
             copySlot(1, 0);
             size_t mark = m_trail.size();
@@ -1588,6 +1823,7 @@ private:
                 trailPush(1, 0);
                 if (m_info[1].unknown) {         // prediction ends here
                     ended = true;
+                    sawUnknown = true;
                     break;
                 }
                 ++reach;
@@ -1608,16 +1844,20 @@ private:
         if (foundDelay > 0 && !m_aborted) {
             r.known = true;
             r.delay = foundDelay;
-            if (c.subTick && m_layout == Layout::Solo) {
+            if (c.subTick && m_layout == Layout::Solo && !cbfActive()) {
                 r.frac = refineFrac(false, pi, foundDelay, 0, horizon, false, target);
             }
+        } else if (foundDelay < 0 && !m_aborted && !sawUnknown) {
+            // fatal now and no delay helps: the input may still have been safe a few ticks earlier
+            r.doomed = true;
+            r.late = lateSearch(pl, mode, pi, target, {}, horizon);
         }   // else: fine right now, nothing saves it, or out of budget -> raw input
 
         ++m_dbgSearches;
         m_lastText = fmt::format(
             "P{} {} d={} {} dies@{} used={}{}",
             pi + 1, target ? "hold" : "release", r.delay,
-            foundDelay == 0 ? "SAFE" : (r.delay > 0 ? "DELAY" : "pass"),
+            foundDelay == 0 ? "SAFE" : (r.delay > 0 ? "DELAY" : (r.late > 0 ? "LATE" : "pass")),
             firstReach, m_used, m_aborted ? " ABORT" : ""
         );
         endSearch();

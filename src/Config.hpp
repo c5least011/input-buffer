@@ -24,6 +24,8 @@ struct Config {
     bool twoPlayerMode = true;          // handle real 2-player mode (off = untouched)
     bool swapTwoPlayer = true;          // unused since the side -> player mapping is learned; kept so old saves load
     bool moveDetect = true;             // a running move trigger makes the prediction back off
+    bool cbfSupport = true;             // Click Between Frames active: leave the step splitting to it (no own sub-tick)
+    bool lateRescue = true;             // a click that would be fatal is moved BACK in time (see maxLate)
     // display
     int previewLen = 60;                // ticks of the live preview
     int previewEvery = 6;               // ticks between preview refreshes
@@ -69,6 +71,11 @@ struct Config {
 
     // per mode: max ticks a press / release may be held back. 0 = mode off.
     int maxDelay[M_COUNT] = {8, 12, 6, 6, 8, 6, 6, 6};
+
+    // per mode: max ticks a LATE press / release may be moved back in time (0 = off).
+    // Only cube, ship, wave and robot are supported: for the other modes a second press
+    // would repeat the impulse (UFO / swing / ball / spider), so they stay at 0.
+    int maxLate[M_COUNT] = {4, 4, 0, 4, 3, 0, 0, 0};
 
     // physics (0 = auto detect)
     int tps = 0;
@@ -138,6 +145,8 @@ inline void loadConfig() {
     c.subTick = gb("subTick", true);
     c.twoPlayerMode = gb("twoPlayerOn", true);
     c.moveDetect = gb("moveDetect", true);
+    c.cbfSupport = gb("cbfOn", true);
+    c.lateRescue = gb("lateOn", true);
     c.swapTwoPlayer = gb("swapTwoP", true);
     c.waveAngles = gb("waveAnglesOn", false);
     c.waveUp = gi("waveUp", 4510, 3000, 8000);
@@ -163,6 +172,9 @@ inline void loadConfig() {
     Config d;
     for (int i = 0; i < M_COUNT; ++i) {
         c.maxDelay[i] = gi((std::string("maxDelay") + std::to_string(i)).c_str(), d.maxDelay[i], 0, 64);
+    }
+    for (int i = 0; i < M_COUNT; ++i) {
+        c.maxLate[i] = gi((std::string("maxLate") + std::to_string(i)).c_str(), d.maxLate[i], 0, 12);
     }
     c.tps = gi("tps", 0, 0, 10000);
     c.fps = gi("fps", 0, 0, 1000);
@@ -204,6 +216,8 @@ inline void saveConfig() {
     m->setSavedValue<bool>("subTick", c.subTick);
     m->setSavedValue<bool>("twoPlayerOn", c.twoPlayerMode);
     m->setSavedValue<bool>("moveDetect", c.moveDetect);
+    m->setSavedValue<bool>("cbfOn", c.cbfSupport);
+    m->setSavedValue<bool>("lateOn", c.lateRescue);
     m->setSavedValue<bool>("swapTwoP", c.swapTwoPlayer);
     m->setSavedValue<bool>("waveAnglesOn", c.waveAngles);
     m->setSavedValue<int64_t>("waveUp", c.waveUp);
@@ -228,6 +242,9 @@ inline void saveConfig() {
     m->setSavedValue<int64_t>("autoForget", c.autoForget);
     for (int i = 0; i < M_COUNT; ++i) {
         m->setSavedValue<int64_t>(std::string("maxDelay") + std::to_string(i), c.maxDelay[i]);
+    }
+    for (int i = 0; i < M_COUNT; ++i) {
+        m->setSavedValue<int64_t>(std::string("maxLate") + std::to_string(i), c.maxLate[i]);
     }
     m->setSavedValue<int64_t>("tps", c.tps);
     m->setSavedValue<int64_t>("fps", c.fps);
