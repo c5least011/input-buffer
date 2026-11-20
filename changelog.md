@@ -18,3 +18,6 @@ made it
 - improve cbf
 - input buffer now save late click [test]
 - fix bugs on cube
+# 1.1.5 beta 2
+- refactor orb
+- add buffer visual

@@ -540,6 +540,7 @@ protected:
             items = {
                 toggle("Late click rescue", &c.lateRescue),
                 toggle("CBF support", &c.cbfSupport),
+                toggle("Save ring effect", &c.saveFx),
                 number("Ship look (ticks)", &c.shipHorizon, 4, 300),
                 number("Wave look (ticks)", &c.waveHorizon, 4, 300),
                 number("Landing settle (ticks)", &c.settle, 1, 30),

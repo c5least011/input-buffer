@@ -61,6 +61,7 @@ public:
         int delay = 0;        // ticks to hold the event back
         bool drop = false;    // swallow the click entirely
         float frac = 1.f;     // 1 = at the start of tick `delay`; < 1 = inside the tick before, after this part of it
+        bool orb = false;     // the chosen delay is the one that lets the click hit an orb
         bool doomed = false;  // no delay survives and the prediction is reliable (late rescue may be tried)
         int late = 0;         // > 0: the input would have been safe this many ticks earlier (state in the late slot)
     };
@@ -125,9 +126,17 @@ private:
     PlayerObject* m_active = nullptr;
     PlayerObject* m_stepObj[2] = {nullptr, nullptr};
     bool m_stepEdge[2] = {false, false};   // this tick presses the button (false -> true)
-    bool m_ringDone[2] = {false, false};   // an orb already reacted to this step's click
+    // Everything the ghost knows about orbs lives in m_orb (see the "orbs" block below).
     struct RingEntry { RingObject* obj; float x; };
-    std::vector<RingEntry> m_rings;        // every orb of the level, sorted by x (see buildRings)
+    struct OrbState {
+        std::vector<RingEntry> rings;      // every orb of the level, sorted by x (see buildRings)
+        bool done[2] = {false, false};     // an orb already reacted to this step's click
+        bool used = false;                 // the run being simulated activated an orb (see orbBegin)
+        bool enabled = true;               // false while the late search runs: a rescue never uses an orb
+        long seen = 0;                     // stats for the Physics page: orbs the ghost touched,
+        long hit = 0;                      // ...that reacted to the clicked tick,
+        long delays = 0;                   // ...and delays that were chosen because of an orb
+    } m_orb;
 
     // search bookkeeping
     int m_used = 0;
@@ -181,9 +190,6 @@ private:
     bool m_inHandle = false;
     PlayerObject* m_recvP = nullptr;
     int m_recvCount = 0;
-    long m_dbgRingSeen = 0;            // orbs the ghost touched
-    long m_dbgRingHit = 0;             // ...that reacted to the clicked tick
-    long m_dbgOrbDelays = 0;           // delays that were chosen because of an orb
     long m_moveUntil = 0;              // a move trigger is running until this tick
     int m_otherOverride = -1;          // dual: assumed hold of the other player (-1 = as the game has it)
     bool m_firing = false;
@@ -224,6 +230,9 @@ private:
 
     float m_measuredDt = 0.25f;
     CCDrawNode* m_draw = nullptr;
+    struct SaveFx { int pi; float age; };          // a ring around the player where the mod saved an input
+    std::vector<SaveFx> m_fx;
+    CCDrawNode* m_fxDraw = nullptr;
 
     // late-click rescue: state of player 1 at the start of the last kHist ticks (ghost copies)
     static constexpr int kHist = 12;
@@ -235,7 +244,6 @@ private:
     int m_histHead = 0;                          // newest entry
     int m_histN = 0;                             // valid entries
     int m_dbgLate = 0;
-    bool m_noOrb = false;                        // late search: orbs are ignored (the rescue never uses one)
     int m_latePending = 0;                       // k of a rescue whose press is about to be delivered
     int m_lateIdx = 0;                           // history entry the rescue starts from
     Mode m_lateMode = M_CUBE;
@@ -277,6 +285,10 @@ public:
         m_draw = CCDrawNode::create();
         m_draw->setZOrder(5000);
         pl->m_objectLayer->addChild(m_draw);
+        m_fxDraw = CCDrawNode::create();
+        m_fxDraw->setZOrder(5001);
+        pl->m_objectLayer->addChild(m_fxDraw);
+        m_fx.clear();
 
         m_dbgInputs = m_dbgSearches = m_dbgDelayed = 0;
         m_lastText = "-";
@@ -302,27 +314,46 @@ public:
         resetInput();
     }
 
+    // ================================================================== orbs
     // The ghost must not depend on the game handing it the orbs: every orb of the level is
     // collected once, so a click is tested against the orbs around the ghost by geometry.
     void buildRings(PlayLayer* pl) {
-        m_rings.clear();
+        m_orb.rings.clear();
         if (!pl || !pl->m_objects) return;
         for (auto* obj : geode::cocos::CCArrayExt<GameObject*>(pl->m_objects)) {
             if (auto ring = geode::cast::typeinfo_cast<RingObject*>(obj)) {
-                m_rings.push_back({ring, ring->getPositionX()});
+                m_orb.rings.push_back({ring, ring->getPositionX()});
             }
         }
-        std::sort(m_rings.begin(), m_rings.end(), [](RingEntry const& a, RingEntry const& b) { return a.x < b.x; });
+        std::sort(m_orb.rings.begin(), m_orb.rings.end(), [](RingEntry const& a, RingEntry const& b) { return a.x < b.x; });
+    }
+
+    // Call before every simulated run whose orb use matters; read the answer with orbUsed() right
+    // after that run. (This replaces comparing a global hit counter before / after, which also
+    // counted the runs of other candidates.)
+    void orbBegin() { m_orb.used = false; }
+    bool orbUsed() const { return m_orb.used; }
+
+    // May the orb of this step react to the click? Only on the very tick the predicted click is
+    // pressed (holding through an orb never activates it), only for the ghost, never in a rescue.
+    bool orbAllowed(int who) const { return cfg().orbDetect && m_orb.enabled && m_stepEdge[who]; }
+
+    // One orb reacted (by geometry or through the game's own playerTouchedRing).
+    void orbNoteHit(int who) {
+        ++m_orb.seen;
+        ++m_orb.hit;
+        m_orb.done[who] = true;
+        m_orb.used = true;
     }
 
     // Ghost, click tick: the orb that overlaps the player reacts (once per click), exactly like
     // the game's own playerTouchedRing would, but found by geometry.
     void simRingsByGeometry(PlayerObject* player, int who, CCRect const& pr) {
-        if (m_ringDone[who] || m_rings.empty()) return;
+        if (m_orb.done[who] || m_orb.rings.empty()) return;
         float px = pr.getMidX();
-        auto it = std::lower_bound(m_rings.begin(), m_rings.end(), px - 90.f,
+        auto it = std::lower_bound(m_orb.rings.begin(), m_orb.rings.end(), px - 90.f,
                                    [](RingEntry const& r, float v) { return r.x < v; });
-        for (; it != m_rings.end() && it->x <= px + 90.f; ++it) {
+        for (; it != m_orb.rings.end() && it->x <= px + 90.f; ++it) {
             RingObject* ring = it->obj;
             if (player->m_touchedRings.find(ring->m_uniqueID) != player->m_touchedRings.end()) continue;
             CCRect rr = ring->getObjectRect();
@@ -331,13 +362,29 @@ public:
             float dx = cx - std::clamp(cx, pr.getMinX(), pr.getMaxX());
             float dy = cy - std::clamp(cy, pr.getMinY(), pr.getMaxY());
             if (dx * dx + dy * dy > r * r) continue;       // orbs are round
-            ++m_dbgRingSeen;
-            ++m_dbgRingHit;
-            m_ringDone[who] = true;
+            orbNoteHit(who);
             player->m_touchedRings.insert(ring->m_uniqueID);   // the game's own path must not fire it again
             player->ringJump(ring, true);
             break;
         }
+    }
+
+    // The game's own path (playerTouchedRing hook): may this orb react?
+    bool canSimRing(PlayerObject* player, EffectGameObject* object) {
+        auto ring = geode::cast::typeinfo_cast<RingObject*>(object);
+        if (!m_simulating || !isSimPlayer(player) || !ring) return false;
+        ++m_orb.seen;
+        if (player->m_touchedRings.find(ring->m_uniqueID) != player->m_touchedRings.end()) return false;
+        int who = player == m_stepObj[0] ? 0 : 1;
+        if (!orbAllowed(who)) return false;
+        orbNoteHit(who);
+        return true;
+    }
+
+    // shown on the Physics page: tells whether the ghost sees orbs at all
+    std::string orbInfo() const {
+        return fmt::format("Orb sim: touched {} | hit on click tick {} | delays for orbs {}",
+                           m_orb.seen, m_orb.hit, m_orb.delays);
     }
 
     void quit() {
@@ -352,7 +399,9 @@ public:
         }
         destroyHist();
         m_draw = nullptr; // owned by the layer
-        m_rings.clear();
+        m_fxDraw = nullptr;
+        m_fx.clear();
+        m_orb.rings.clear();
         m_ready = false;
         m_inUpdate = false;
         m_simulating = false;
@@ -373,6 +422,8 @@ public:
 
     void onReset() { // level restart / respawn
         m_histN = 0;
+        m_fx.clear();
+        if (m_fxDraw) m_fxDraw->clear();
         for (int i = 0; i < 2; ++i) {
             m_pend[i].clear();
             m_supp[i] = false;
@@ -463,7 +514,7 @@ public:
         if (!m_simulating || !pl || !isSimPlayer(player) || !vec) return;
         int who = player == m_stepObj[1] ? 1 : 0;
         CCRect pr = player->getObjectRect();
-        if (cfg().orbDetect && !m_noOrb && m_stepEdge[who]) simRingsByGeometry(player, who, pr);
+        if (orbAllowed(who)) simRingsByGeometry(player, who, pr);
         for (int i = 0; i < count; ++i) {
             GameObject* obj = vec->at(i);
             if (!obj) continue;
@@ -483,26 +534,6 @@ public:
                 m_hitUnknown = true;
             }
         }
-    }
-
-    // An orb only reacts to the click being predicted, on the very tick that
-    // click is pressed. Holding through orbs never activates them.
-    bool canSimRing(PlayerObject* player, EffectGameObject* object) {
-        auto ring = geode::cast::typeinfo_cast<RingObject*>(object);
-        if (!m_simulating || !isSimPlayer(player) || !ring) return false;
-        ++m_dbgRingSeen;
-        if (player->m_touchedRings.find(ring->m_uniqueID) != player->m_touchedRings.end()) {
-            return false;
-        }
-        bool ok = cfg().orbDetect && !m_noOrb && m_stepEdge[player == m_stepObj[0] ? 0 : 1];
-        if (ok) ++m_dbgRingHit;
-        return ok;
-    }
-
-    // shown on the Physics page: tells whether the ghost sees orbs at all
-    std::string orbInfo() const {
-        return fmt::format("Orb sim: touched {} | hit on click tick {} | delays for orbs {}",
-                           m_dbgRingSeen, m_dbgRingHit, m_dbgOrbDelays);
     }
 
     // ------------------------------------------------- who really gets the input
@@ -927,11 +958,10 @@ private:
         Mode mode = detectMode(po);
         m_otherOverride = (m_layout == Layout::DualSolo) ? (push ? 1 : 0) : -1;
         Decision d;
-        long ringBefore = m_dbgRingHit;
         if (isContinuous(mode)) d = decideHold(pl, mode, pi, push);
         else if (push) d = decideClick(pl, mode, pi);
         m_otherOverride = -1;
-        if (d.known && d.delay > 0 && m_dbgRingHit != ringBefore) ++m_dbgOrbDelays;
+        if (d.known && d.delay > 0 && d.orb) ++m_orb.delays;
 
         if (d.late > 0 && beginLate(pl, pi, po, mode, d.late)) {   // fatal now, safe k ticks ago: rewound
             m_game[pi] = push;
@@ -947,7 +977,7 @@ private:
             return false;
         }
         ++m_dbgDelayed;
-        if (cfg().logEnabled) logRescue(pi, mode, po, d.delay);
+        logSaved(pi, mode, d.delay);
         pend.push_back({a + d.delay, push, d.frac});
         m_arr[pi] = a;
         m_owed[pi] = true;
@@ -976,6 +1006,7 @@ public:
         bool p = pend.front().push;
         pend.pop_front();
         fire(pl, 0, p);
+        spawnFx(0);
         if (pend.empty() && !m_supp[0]) m_owed[0] = false;
     }
 
@@ -1041,6 +1072,7 @@ public:
         }
 
         histPush(pl);
+        fxTick(pl);
 
         bool autoOn = cf.autoplay && m_ready && m_layout != Layout::TwoPlayer &&
                       pl->m_player1 && !pl->m_player1->m_isDead;
@@ -1094,6 +1126,7 @@ private:
             bool p = pend.front().push;
             pend.pop_front();
             fire(pl, pi, p);
+            spawnFx(pi);
             if (pend.empty() && !m_supp[pi]) m_owed[pi] = false;
         }
     }
@@ -1173,18 +1206,57 @@ private:
         pl->flipGravity(player, upsideDown, true);
     }
 
-    // One line per rescued event: what the game was running at, how much the event was
-    // held back, in which mode, and which way gravity points.
-    void logRescue(int pi, Mode mode, PlayerObject* po, int ticks) {
-        float tps = effectiveTps();
-        float ms = tps > 0.f ? static_cast<float>(ticks) * 1000.f / tps : 0.f;
-        m_log.push_back(fmt::format(
-            "TPS {:.0f} | FPS {:.0f} | saved {}t | {:.1f}ms | {} P{} | {} gravity{}",
-            tps, effectiveFps(), ticks, ms, kModeNames[mode], pi + 1,
-            po->m_isUpsideDown ? "flipped" : "normal",
-            cbfLoaded() ? " | CBF" : ""
-        ));
+    // One line per saved input: "saved +4 ticks | Cube | P1".
+    // Positive = the input was held back (delay), negative = moved back in time (late rescue).
+    void logSaved(int pi, Mode mode, int ticks) {
+        if (!cfg().logEnabled) return;
+        m_log.push_back(fmt::format("saved {:+d} ticks | {} | P{}", ticks, kModeNames[mode], pi + 1));
         while (static_cast<int>(m_log.size()) > kLogMax) m_log.pop_front();   // oldest goes first
+    }
+
+    // ---- "saved" ring: a white ring with a dark centre that grows and fades around the player
+    static constexpr float kFxLife = 0.3f;         // seconds
+
+    void spawnFx(int pi) {
+        if (!cfg().saveFx || !m_fxDraw) return;
+        if (m_fx.size() >= 6) m_fx.erase(m_fx.begin());
+        m_fx.push_back({pi, 0.f});
+    }
+
+    void drawRing(CCPoint c, float t) {
+        float e = 1.f - (1.f - t) * (1.f - t);     // ease out
+        float r = 14.f + 22.f * e;
+        float a = 1.f - t;
+        m_fxDraw->drawDot(c, r, {0.f, 0.f, 0.f, 0.55f * a});
+        constexpr int n = 32;
+        float w = 1.6f * (1.f - 0.5f * t);
+        CCPoint prev = ccp(c.x + r, c.y);
+        for (int i = 1; i <= n; ++i) {
+            float ang = 6.2831853f * static_cast<float>(i) / static_cast<float>(n);
+            CCPoint cur = ccp(c.x + r * std::cos(ang), c.y + r * std::sin(ang));
+            m_fxDraw->drawSegment(prev, cur, w, {1.f, 1.f, 1.f, 0.95f * a});
+            prev = cur;
+        }
+    }
+
+    // every tick: redraw the rings (they follow the player until they fade out)
+    void fxTick(PlayLayer* pl) {
+        if (!m_fxDraw) return;
+        m_fxDraw->clear();
+        if (m_fx.empty()) return;
+        float tps = effectiveTps();
+        float dt = tps > 0.f ? 1.f / tps : 1.f / 240.f;
+        for (auto it = m_fx.begin(); it != m_fx.end();) {
+            it->age += dt;
+            float t = it->age / kFxLife;
+            if (t >= 1.f) {
+                it = m_fx.erase(it);
+                continue;
+            }
+            PlayerObject* po = it->pi == 0 ? pl->m_player1 : pl->m_player2;
+            if (po) drawRing(po->getPosition(), t);
+            ++it;
+        }
     }
 
     void fire(PlayLayer* pl, int pi, bool push) {
@@ -1343,7 +1415,7 @@ private:
         m_stepObj[0] = a;
         m_stepObj[1] = b;
         m_stepEdge[0] = m_stepEdge[1] = false;
-        m_ringDone[0] = m_ringDone[1] = false;
+        m_orb.done[0] = m_orb.done[1] = false;
         m_stepEdge[m_tp] = hold && !wasHold;
         if (m_mirror) m_stepEdge[1] = m_stepEdge[0];
         m_curSlot = s;
@@ -1480,7 +1552,7 @@ private:
     // the tick after which the click can happen (1 = at the start of tick d, i.e. no gain).
     // The tick limit (max delay) only bounds the search; the click itself goes where the ghost says.
     bool trialSplit(bool click, int pi, int d, int h, int horizon, bool airMode, bool target, float f, bool groundMode) {
-        long ringsBefore = m_dbgRingHit;
+        orbBegin();
         copySlot(1, 2);
         m_info[1].groundTicks = 0;
         m_partial = true;
@@ -1498,7 +1570,7 @@ private:
             bool unk = false;
             bool good = rollClick(1, d, std::max(0, h - 1), horizon, airMode, reach, unk);
             // a ground mode only counts if the click really does something (jump from the ground, or an orb)
-            if (good && groundMode && !m_info[2].grounded && m_dbgRingHit == ringsBefore) return false;
+            if (good && groundMode && !m_info[2].grounded && !orbUsed()) return false;
             return good && !unk && !m_aborted;
         }
         for (int t = d; t < horizon; ++t) {
@@ -1568,7 +1640,7 @@ private:
                 size_t mark = m_trail.size();
                 trailPush(0, 1);
                 bool unk = false;
-                long ringsBefore = m_dbgRingHit;
+                orbBegin();
                 if (groundMode && !canAct) {
                     // In the air only an orb can make the click useful. Probing 2 ticks is enough to see
                     // that, so a long fall does not cost a full look-ahead per tick (that used to eat
@@ -1576,23 +1648,25 @@ private:
                     int r0 = d;
                     bool u0 = false;
                     bool probe = rollClick(1, d, h, d + 2, false, r0, u0);
-                    if (!probe || m_dbgRingHit == ringsBefore) {
+                    if (!probe || !orbUsed()) {
                         m_trail.resize(mark);
                         if (m_aborted) break;
                         continue;
                     }
                     copySlot(1, 0);
                     m_info[1].groundTicks = 0;
+                    orbBegin();
                 }
                 ok = rollClick(1, d, h, horizon, airMode, reach, unk);
                 if (ok && unk && d > 0) {             // "cannot predict further" is no rescue
                     ok = false;
                     sawUnknown = true;
                 }
-                if (ok && !canAct && m_dbgRingHit == ringsBefore) ok = false;   // wasted click in the air
+                if (ok && !canAct && !orbUsed()) ok = false;   // wasted click in the air
                 if (ok) {
                     foundDelay = d;
                     foundHold = h;
+                    r.orb = orbUsed();               // this very run is the chosen one
                     if (m_wantTrail) m_trailOk = m_trail;
                     break;
                 }
@@ -1714,7 +1788,7 @@ private:
         bool continuous = isContinuous(mode);
         bool wantTrail = m_wantTrail;
         m_wantTrail = false;                           // no trail for the late search
-        m_noOrb = true;                                // a rescue never uses an orb
+        m_orb.enabled = false;                         // a rescue never uses an orb
         int found = 0;
         for (int k = 1; k <= maxK && !found; ++k) {
             int off = k - 1 + (m_inUpdate ? 1 : 0);
@@ -1764,7 +1838,7 @@ private:
             if (m_aborted) break;
         }
         m_wantTrail = wantTrail;
-        m_noOrb = false;
+        m_orb.enabled = true;
         return found;
     }
 
@@ -1823,15 +1897,8 @@ private:
         m_histN = 0;                                   // the stored states are of the old timeline
         ++m_dbgLate;
         m_lastText = fmt::format("P1 LATE rescue: moved back {} ticks", k);
-        if (cfg().logEnabled) {
-            float tps = effectiveTps();
-            m_log.push_back(fmt::format(
-                "TPS {:.0f} | FPS {:.0f} | LATE saved {}t | {:.1f}ms | {}{}",
-                tps, effectiveFps(), k, tps > 0.f ? static_cast<float>(k) * 1000.f / tps : 0.f,
-                kModeNames[m_lateMode], cbfActive() ? " | CBF" : ""
-            ));
-            while (static_cast<int>(m_log.size()) > kLogMax) m_log.pop_front();
-        }
+        logSaved(0, m_lateMode, -k);
+        spawnFx(0);
     }
 
     // ========================================================= ship / wave

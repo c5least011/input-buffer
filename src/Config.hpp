@@ -25,6 +25,7 @@ struct Config {
     bool swapTwoPlayer = true;          // unused since the side -> player mapping is learned; kept so old saves load
     bool moveDetect = true;             // a running move trigger makes the prediction back off
     bool cbfSupport = true;             // Click Between Frames active: leave the step splitting to it (no own sub-tick)
+    bool saveFx = true;                 // ring around the player when the mod saves an input
     bool lateRescue = true;             // a click that would be fatal is moved BACK in time (see maxLate)
     // display
     int previewLen = 60;                // ticks of the live preview
@@ -148,6 +149,7 @@ inline void loadConfig() {
     c.moveDetect = gb("moveDetect", true);
     c.cbfSupport = gb("cbfOn", true);
     c.lateRescue = gb("lateOn", true);
+    c.saveFx = gb("fxOn", true);
     c.swapTwoPlayer = gb("swapTwoP", true);
     c.waveAngles = gb("waveAnglesOn", false);
     c.waveUp = gi("waveUp", 4510, 3000, 8000);
@@ -227,6 +229,7 @@ inline void saveConfig() {
     m->setSavedValue<bool>("moveDetect", c.moveDetect);
     m->setSavedValue<bool>("cbfOn", c.cbfSupport);
     m->setSavedValue<bool>("lateOn", c.lateRescue);
+    m->setSavedValue<bool>("fxOn", c.saveFx);
     m->setSavedValue<bool>("swapTwoP", c.swapTwoPlayer);
     m->setSavedValue<bool>("waveAnglesOn", c.waveAngles);
     m->setSavedValue<int64_t>("waveUp", c.waveUp);
