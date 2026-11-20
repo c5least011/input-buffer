@@ -153,7 +153,7 @@ private:
     bool m_phys[2] = {false, false};   // what your finger does
     bool m_game[2] = {false, false};   // what the game has been told
     bool m_supp[2] = {false, false};
-    struct Pend { long tick; bool push; float frac = 1.f; };
+    struct Pend { long tick; bool push; float frac = 1.f; int saved = 0; };   // saved = ticks it was held back
     std::deque<Pend> m_pend[2];        // events held back (only ever filled by a rescue)
     long m_arr[2] = {0, 0};            // arrival tick of the last held-back event
     long m_now = 0;                    // physics ticks started so far
@@ -230,8 +230,9 @@ private:
 
     float m_measuredDt = 0.25f;
     CCDrawNode* m_draw = nullptr;
-    struct SaveFx { int pi; float age; };          // a ring around the player where the mod saved an input
-    std::vector<SaveFx> m_fx;
+    // "saved" marks: a small ring + the tick count, left in the level where the mod saved an input
+    std::vector<CCLabelBMFont*> m_fxLabels;
+    std::vector<CCPoint> m_fxPts;
     CCDrawNode* m_fxDraw = nullptr;
 
     // late-click rescue: state of player 1 at the start of the last kHist ticks (ghost copies)
@@ -288,7 +289,8 @@ public:
         m_fxDraw = CCDrawNode::create();
         m_fxDraw->setZOrder(5001);
         pl->m_objectLayer->addChild(m_fxDraw);
-        m_fx.clear();
+        m_fxLabels.clear();
+        m_fxPts.clear();
 
         m_dbgInputs = m_dbgSearches = m_dbgDelayed = 0;
         m_lastText = "-";
@@ -400,7 +402,8 @@ public:
         destroyHist();
         m_draw = nullptr; // owned by the layer
         m_fxDraw = nullptr;
-        m_fx.clear();
+        m_fxLabels.clear();                            // owned by the layer
+        m_fxPts.clear();
         m_orb.rings.clear();
         m_ready = false;
         m_inUpdate = false;
@@ -422,8 +425,7 @@ public:
 
     void onReset() { // level restart / respawn
         m_histN = 0;
-        m_fx.clear();
-        if (m_fxDraw) m_fxDraw->clear();
+        clearFx();
         for (int i = 0; i < 2; ++i) {
             m_pend[i].clear();
             m_supp[i] = false;
@@ -949,7 +951,7 @@ private:
             // the spacing you had (no new search, nothing is "re-decided")
             long fireAt = pend.back().tick + std::max<long>(1, a - m_arr[pi]);
             m_arr[pi] = a;
-            pend.push_back({fireAt, push});
+            pend.push_back({fireAt, push, 1.f, static_cast<int>(fireAt - a)});
             m_owed[pi] = true;
             return false;
         }
@@ -978,7 +980,7 @@ private:
         }
         ++m_dbgDelayed;
         logSaved(pi, mode, d.delay);
-        pend.push_back({a + d.delay, push, d.frac});
+        pend.push_back({a + d.delay, push, d.frac, d.delay});
         m_arr[pi] = a;
         m_owed[pi] = true;
         return false;
@@ -1004,9 +1006,10 @@ public:
         auto& pend = m_pend[0];
         if (!pl || pend.empty()) return;
         bool p = pend.front().push;
+        int sv = pend.front().saved;
         pend.pop_front();
         fire(pl, 0, p);
-        spawnFx(0);
+        if (pl->m_player1) spawnFx(pl->m_player1->getPosition(), sv);
         if (pend.empty() && !m_supp[0]) m_owed[0] = false;
     }
 
@@ -1072,7 +1075,6 @@ public:
         }
 
         histPush(pl);
-        fxTick(pl);
 
         bool autoOn = cf.autoplay && m_ready && m_layout != Layout::TwoPlayer &&
                       pl->m_player1 && !pl->m_player1->m_isDead;
@@ -1124,9 +1126,10 @@ private:
         }
         if (!pend.empty() && pend.front().tick <= m_now) {
             bool p = pend.front().push;
+            int sv = pend.front().saved;
             pend.pop_front();
             fire(pl, pi, p);
-            spawnFx(pi);
+            spawnFx(po->getPosition(), sv);
             if (pend.empty() && !m_supp[pi]) m_owed[pi] = false;
         }
     }
@@ -1214,49 +1217,58 @@ private:
         while (static_cast<int>(m_log.size()) > kLogMax) m_log.pop_front();   // oldest goes first
     }
 
-    // ---- "saved" ring: a white ring with a dark centre that grows and fades around the player
-    static constexpr float kFxLife = 0.3f;         // seconds
+    // ---- "saved" mark: a small white ring with a dark centre and the tick count next to it.
+    // It stays where the input was saved (it scrolls with the level, it does not follow the
+    // player) until the level restarts. At most kFxMax marks are kept.
+    static constexpr size_t kFxMax = 64;
 
-    void spawnFx(int pi) {
-        if (!cfg().saveFx || !m_fxDraw) return;
-        if (m_fx.size() >= 6) m_fx.erase(m_fx.begin());
-        m_fx.push_back({pi, 0.f});
-    }
-
-    void drawRing(CCPoint c, float t) {
-        float e = 1.f - (1.f - t) * (1.f - t);     // ease out
-        float r = 14.f + 22.f * e;
-        float a = 1.f - t;
-        m_fxDraw->drawDot(c, r, {0.f, 0.f, 0.f, 0.55f * a});
-        constexpr int n = 32;
-        float w = 1.6f * (1.f - 0.5f * t);
-        CCPoint prev = ccp(c.x + r, c.y);
-        for (int i = 1; i <= n; ++i) {
-            float ang = 6.2831853f * static_cast<float>(i) / static_cast<float>(n);
-            CCPoint cur = ccp(c.x + r * std::cos(ang), c.y + r * std::sin(ang));
-            m_fxDraw->drawSegment(prev, cur, w, {1.f, 1.f, 1.f, 0.95f * a});
-            prev = cur;
+    void clearFx() {
+        for (auto* l : m_fxLabels) {
+            if (l) l->removeFromParent();
         }
+        m_fxLabels.clear();
+        m_fxPts.clear();
+        if (m_fxDraw) m_fxDraw->clear();
     }
 
-    // every tick: redraw the rings (they follow the player until they fade out)
-    void fxTick(PlayLayer* pl) {
-        if (!m_fxDraw) return;
+    void redrawFx(std::vector<CCPoint> const& pts) {
         m_fxDraw->clear();
-        if (m_fx.empty()) return;
-        float tps = effectiveTps();
-        float dt = tps > 0.f ? 1.f / tps : 1.f / 240.f;
-        for (auto it = m_fx.begin(); it != m_fx.end();) {
-            it->age += dt;
-            float t = it->age / kFxLife;
-            if (t >= 1.f) {
-                it = m_fx.erase(it);
-                continue;
+        constexpr float r = 13.f;
+        constexpr int n = 28;
+        for (auto const& c : pts) {
+            m_fxDraw->drawDot(c, r, {0.f, 0.f, 0.f, 0.6f});
+            CCPoint prev = ccp(c.x + r, c.y);
+            for (int i = 1; i <= n; ++i) {
+                float ang = 6.2831853f * static_cast<float>(i) / static_cast<float>(n);
+                CCPoint cur = ccp(c.x + r * std::cos(ang), c.y + r * std::sin(ang));
+                m_fxDraw->drawSegment(prev, cur, 1.2f, {1.f, 1.f, 1.f, 0.95f});
+                prev = cur;
             }
-            PlayerObject* po = it->pi == 0 ? pl->m_player1 : pl->m_player2;
-            if (po) drawRing(po->getPosition(), t);
-            ++it;
         }
+    }
+
+    // `ticks` > 0 delay, < 0 rollback (same sign as the log)
+    void spawnFx(CCPoint at, int ticks) {
+        PlayLayer* pl = PlayLayer::get();
+        if (!cfg().saveFx || !m_fxDraw || !pl) return;
+        m_fxPts.push_back(at);
+        auto* label = CCLabelBMFont::create(fmt::format("{:+d}", ticks).c_str(), "chatFont.fnt");
+        if (label) {
+            label->setScale(0.45f);
+            label->setAnchorPoint({0.f, 0.5f});
+            label->setPosition(ccp(at.x + 17.f, at.y));
+            label->setZOrder(5002);
+            pl->m_objectLayer->addChild(label);
+            m_fxLabels.push_back(label);
+        }
+        if (m_fxPts.size() > kFxMax) {                 // oldest goes first
+            m_fxPts.erase(m_fxPts.begin());
+            if (!m_fxLabels.empty()) {
+                if (m_fxLabels.front()) m_fxLabels.front()->removeFromParent();
+                m_fxLabels.erase(m_fxLabels.begin());
+            }
+        }
+        redrawFx(m_fxPts);
     }
 
     void fire(PlayLayer* pl, int pi, bool push) {
@@ -1884,6 +1896,7 @@ private:
         PlayerObject* h = m_hist[m_lateIdx];
         if (!po || !g || !h || po->m_isDead) return;
         float startX = h->getPositionX();
+        CCPoint startPos = h->getPosition();
         copyPhysics(po, g);
         if (m_lateMode == M_WAVE && po->m_waveTrail && po->m_waveTrail->m_pointArray) {
             auto* arr = po->m_waveTrail->m_pointArray;
@@ -1898,7 +1911,7 @@ private:
         ++m_dbgLate;
         m_lastText = fmt::format("P1 LATE rescue: moved back {} ticks", k);
         logSaved(0, m_lateMode, -k);
-        spawnFx(0);
+        spawnFx(startPos, -k);
     }
 
     // ========================================================= ship / wave
