@@ -21,3 +21,5 @@ made it
 # 1.1.5 beta 2
 - refactor orb
 - add buffer visual
+# 1.1.5
+- fix D-block not detect properly
