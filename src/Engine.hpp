@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <vector>
 #include "Config.hpp"
+#include "DBlock.hpp"
 
 using namespace geode::prelude;
 
@@ -629,6 +630,7 @@ public:
     // Player 1's PlayerObject::update is running. A nested update (CBF calls it again for each
     // sub-step) is not a new tick, and a click delivered now lands inside the tick.
     bool inUpdate() const { return m_inUpdate; }
+    bool dBlockSim() const { return cfg().dBlock; }
     void resetMarks() { clearFx(); }   // level restart: the saved marks go
     void endLate() { finishLate(); }
     void setInUpdate(bool v) { m_inUpdate = v; }
@@ -1148,6 +1150,9 @@ private:
     }
 
     static TouchKind classify(GameObject* o) {
+        // D / J / S / H blocks are plain collision for the ghost: the game's own collision code
+        // does the rest (wave slides on them). With "D block sim" off they stop the prediction.
+        if (isSpecialBlock(o)) return cfg().dBlock ? TouchKind::None : TouchKind::Unknown;
         switch (o->m_objectType) {
             case GameObjectType::InverseGravityPortal:
             case GameObjectType::NormalGravityPortal:
@@ -1182,7 +1187,7 @@ private:
             case GameObjectType::DualPortal:
             case GameObjectType::SoloPortal:
             case GameObjectType::TeleportPortal:
-            case GameObjectType::Breakable:            // D block (always on)
+            case GameObjectType::Breakable:
                 return TouchKind::Unknown;
             default:
                 return TouchKind::None;
