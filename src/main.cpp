@@ -304,6 +304,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                 }
                 auto type = obj->m_objectType;
                 if (type == GameObjectType::Solid ||
+                    (g_engine.dBlockSim() && buf::isSpecialBlock(obj)) ||             // D / J / S / H blocks, by ID
                     type == GameObjectType::Hazard ||
                     type == GameObjectType::AnimatedHazard ||
                     type == GameObjectType::CollisionObject ||
@@ -313,6 +314,30 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     type == GameObjectType::GravityTogglePortal ||
                     geode::cast::typeinfo_cast<RingObject*>(obj)) {
                     extra.push_back(obj);
+                }
+            }
+            // dynamic collision blocks (the "D" ones) are solid: wave slides on them. They may not be in
+            // the list the game handed us, so the ones near the ghost are added.
+            if (g_engine.dBlockSim()) {
+                auto* pl2 = PlayLayer::get();
+                if (pl2 && pl2->m_collisionBlocks && pl2->m_collisionBlocks->count() > 0) {
+                    CCRect pr = player->getObjectRect();
+                    pr.origin.x -= 60.f;
+                    pr.origin.y -= 60.f;
+                    pr.size.width += 120.f;
+                    pr.size.height += 120.f;
+                    for (auto* o : geode::cocos::CCArrayExt<GameObject*>(pl2->m_collisionBlocks)) {
+                        if (!buf::isDynamicCollisionBlock(o)) continue;
+                        bool dup = false;
+                        for (size_t k = 0; k < extra.size(); ++k) {
+                            if (extra[k] == o) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (dup || !o->getObjectRect().intersectsRect(pr)) continue;
+                        extra.push_back(o);
+                    }
                 }
             }
             GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
