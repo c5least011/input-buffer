@@ -39,9 +39,9 @@ inline std::vector<Key> const& keys() {
                     I{"minBudget", 50, 5000, 300}, I{"noclipTicks", 0, 5000, 480}, I{"failOpen", 1, 60, 4},
                     I{"waveUp", 3000, 8000, 4510}, I{"waveDown", 3000, 8000, 4490}, I{"miniUp", 3000, 8500, 6343},
                     I{"miniDown", 3000, 8500, 6343}, I{"trajectory", 20, 400, 120}, I{"shipImminent", 2, 120, 16},
-                    I{"waveImminent", 2, 120, 10}, I{"holdGain", 1, 30, 4}, I{"autoHorizon", 20, 300, 70},
-                    I{"autoEvery", 1, 30, 4}, I{"autoPaths", 1, 12, 3}, I{"autoStride", 1, 12, 3},
-                    I{"autoBudget", 200, 20000, 1500}, I{"autoCell", 2, 60, 8}, I{"autoWindow", 5, 400, 48},
+                    I{"waveImminent", 2, 120, 10}, I{"holdGain", 1, 30, 4}, I{"autoHorizon", 20, 2400, 70},
+                    I{"autoEvery", 1, 30, 4}, I{"autoPaths", 1, 1000, 3}, I{"autoStride", 1, 12, 3},
+                    I{"autoBudget", 200, 120000, 1500}, I{"autoCell", 2, 60, 8}, I{"autoWindow", 5, 400, 48},
                     I{"autoPrune", 1, 20, 4}, I{"autoForget", 20, 2000, 120}, I{"tps", 0, 10000, 0},
                     I{"fps", 0, 1000, 0}, I{"tapTicks", 1, 40, 4}, I{"budget", 200, 40000, 3000},
                     I{"shipLook", 4, 300, 36}, I{"waveLook", 4, 300, 24}}) {
