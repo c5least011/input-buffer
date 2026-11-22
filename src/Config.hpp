@@ -165,11 +165,11 @@ inline void loadConfig() {
     c.autoplay = gb("autoplay", false);
     c.autoLearn = gb("autoLearn", true);
     c.autoKeep = gb("autoKeep", false);
-    c.autoHorizon = gi("autoHorizon", 70, 20, 300);
+    c.autoHorizon = gi("autoHorizon", 70, 20, 2400);
     c.autoEvery = gi("autoEvery", 4, 1, 30);
-    c.autoPaths = gi("autoPaths", 3, 1, 12);
+    c.autoPaths = gi("autoPaths", 3, 1, 1000);
     c.autoStride = gi("autoStride", 3, 1, 12);
-    c.autoBudget = gi("autoBudget", 1500, 200, 20000);
+    c.autoBudget = gi("autoBudget", 1500, 200, 120000);
     c.autoCell = gi("autoCell", 8, 2, 60);
     c.autoWindow = gi("autoWindow", 48, 5, 400);
     c.autoPrune = gi("autoPrune", 4, 1, 20);
