@@ -217,6 +217,10 @@ private:
     std::vector<AiSeg> m_aiPlan;       // the route autoplay is following
     int m_aiPlanPos = 0;               // ticks already played of it
     int m_aiPlanTotal = 0;             // its length in ticks
+    std::vector<AiSeg> m_aiNext;       // the next route, built at 80% from where this one is at 90%
+    int m_aiNextTotal = 0;
+    bool m_aiNextReady = false;
+    bool m_aiNextTried = false;        // built (or tried) for the current route already
     int m_forceLen = 0;                // route search: the first levels are fixed (a branch)
     bool m_force[kSlots] = {};
     bool m_aiContinuous = false;       // ship / wave: the default is "keep the input"; click modes: "do nothing"
@@ -2103,6 +2107,25 @@ private:
         m_aiPlan.clear();
         m_aiPlanPos = 0;
         m_aiPlanTotal = 0;
+        m_aiNext.clear();
+        m_aiNextTotal = 0;
+        m_aiNextReady = false;
+        m_aiNextTried = false;
+    }
+
+    // hold state of a route at tick `idx` (past its end: the last one)
+    static bool aiHoldAt(std::vector<AiSeg> const& plan, int idx, bool dflt) {
+        if (plan.empty()) return dflt;
+        int acc = 0;
+        bool h = plan.back().hold;
+        for (auto const& st : plan) {
+            if (idx < acc + st.seg) {
+                h = st.hold;
+                break;
+            }
+            acc += st.seg;
+        }
+        return h;
     }
 
     // Does the plan survive when it is shifted by `shift` ticks (late > 0 / early < 0)?
@@ -2136,16 +2159,41 @@ private:
     //  3. Of the complete routes the most stable one is followed: the one that still lives when
     //     all its timings are shifted by -2..+2 ticks, then the one with fewer switches.
     // m_aiPlan = the chosen route. true = it survives the whole look-ahead.
-    bool planAuto(PlayLayer* pl) {
+    // lead > 0: build the NEXT route (m_aiNext) instead: it starts where the current route is `lead`
+    // ticks from now (that is, the old route is followed for `lead` ticks first).
+    bool planAuto(PlayLayer* pl, int lead = 0) {
         auto& c = cfg();
+        bool toNext = lead > 0;
         int s0 = std::max(1, c.autoStride);
         m_aiHorizon = c.autoHorizon;
         m_levels.clear();
+        // Decision steps: fine near the player (stride), then growing so that the few levels the
+        // ghost slots allow still cover the whole look-ahead (it can be thousands of ticks).
         int total = 0;
-        for (int i = 0; total < m_aiHorizon && i < kSlots - 2; ++i) {
-            int seg = i < 6 ? s0 : (s0 << std::min(i - 5, 5));
-            m_levels.push_back(seg);
-            total += seg;
+        int fine = std::min(6, kSlots - 2);
+        for (int i = 0; i < fine && total < m_aiHorizon; ++i) {
+            m_levels.push_back(s0);
+            total += s0;
+        }
+        int rest = kSlots - 2 - fine;
+        if (total < m_aiHorizon && rest > 0) {
+            float growth = 2.f;                       // doubling is enough for short look-aheads
+            for (;;) {
+                float seg = static_cast<float>(s0), sum = 0.f;
+                for (int k = 0; k < rest; ++k) {
+                    seg *= growth;
+                    sum += seg;
+                }
+                if (static_cast<float>(total) + sum >= static_cast<float>(m_aiHorizon) || growth > 60.f) break;
+                growth += 0.25f;
+            }
+            float seg = static_cast<float>(s0);
+            for (int k = 0; k < rest && total < m_aiHorizon; ++k) {
+                seg *= growth;
+                int sg = std::max(1, static_cast<int>(seg));
+                m_levels.push_back(sg);
+                total += sg;
+            }
         }
 
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);   // autoplay: one input, both players
@@ -2155,6 +2203,18 @@ private:
 
         int paths = std::max(1, c.autoPaths);
         bool prev = m_game[0];
+        if (toNext) {
+            // follow the current route for `lead` ticks: the new routes start from there
+            bool h = prev;
+            for (int t = 0; t < lead; ++t) {
+                h = aiHoldAt(m_aiPlan, m_aiPlanPos + t, m_aiHold);
+                if (!step(0, h) || m_info[0].unknown) {       // dies / cannot be predicted: no next route
+                    endSearch();
+                    return false;
+                }
+            }
+            prev = h;
+        }
         bool genDefault = m_aiContinuous ? prev : false;
         (void)genDefault;
 
@@ -2231,11 +2291,24 @@ private:
         long bestScore = -1;
         if (!routes.empty()) {
             m_aborted = false;
-            m_budget = m_used + static_cast<int>(routes.size()) * 4 * m_aiHorizon + 64;
-            for (size_t i = 0; i < routes.size(); ++i) {
+            // only the longest / simplest few are tested with shifted timings (with hundreds of routes
+            // and a long look-ahead that would cost far more than the search itself)
+            constexpr size_t kStab = 16;
+            std::vector<size_t> order;
+            for (size_t i = 0; i < routes.size(); ++i) order.push_back(i);
+            std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                if (routes[a].len != routes[b].len) return routes[a].len > routes[b].len;
+                return routes[a].toggles < routes[b].toggles;
+            });
+            size_t testN = std::min(routes.size(), kStab);
+            m_budget = m_used + static_cast<int>(testN) * 4 * m_aiHorizon + 64;
+            for (size_t k = 0; k < order.size(); ++k) {
+                size_t i = order[k];
                 static constexpr int shifts[4] = {-2, -1, 1, 2};
-                for (int sh : shifts) {
-                    if (aiSurvives(routes[i].plan, sh, prev)) ++routes[i].tol;
+                if (k < testN) {
+                    for (int sh : shifts) {
+                        if (aiSurvives(routes[i].plan, sh, prev)) ++routes[i].tol;
+                    }
                 }
                 long score = 1000000L + routes[i].tol * 10000L - routes[i].toggles * 100L + routes[i].len;
                 if (score > bestScore) {
@@ -2246,18 +2319,31 @@ private:
         }
 
         bool ok = best >= 0;
+        std::vector<AiSeg> outPlan;
+        int outTotal = 1;
+        bool useful = true;
         if (ok) {
-            m_aiPlan = routes[best].plan;
-            m_aiPlanTotal = std::max(1, routes[best].len);
-            if (m_wantTrail) m_trailOk = routes[best].trail;
+            outPlan = routes[best].plan;
+            outTotal = std::max(1, routes[best].len);
+            if (m_wantTrail && !toNext) m_trailOk = routes[best].trail;
         } else if (!partial.empty()) {
-            m_aiPlan = partial;
-            m_aiPlanTotal = std::max(1, partialReach);
+            outPlan = partial;
+            outTotal = std::max(1, partialReach);
         } else {
-            m_aiPlan.assign(1, AiSeg{prev, 1});
-            m_aiPlanTotal = 1;
+            outPlan.assign(1, AiSeg{prev, 1});
+            useful = false;                                      // nothing was found
         }
-        m_aiPlanPos = 0;
+        if (toNext) {
+            m_aiNextReady = useful;
+            if (useful) {
+                m_aiNext = std::move(outPlan);
+                m_aiNextTotal = outTotal;
+            }
+        } else {
+            m_aiPlan = std::move(outPlan);
+            m_aiPlanTotal = outTotal;
+            m_aiPlanPos = 0;
+        }
         endSearch();
         return ok;
     }
@@ -2278,11 +2364,34 @@ private:
             if (it != m_ai.end()) it->second.bad[st.hold ? 1 : 0] *= 0.6f;
         }
 
-        if (m_aiPlan.empty() || m_aiPlanPos * 10 >= m_aiPlanTotal * 9) {   // 90% played: think up new routes
-            bool ok = planAuto(pl);
-            ++m_dbgSearches;
-            m_lastText = fmt::format("AI {} paths={} len={}t used={}", ok ? "plan" : "best",
-                                     c.autoPaths, m_aiPlanTotal, m_used);
+        // 80% played: build the next route at once (nothing waits). It starts from where this route
+        // is at 90%, so it is ready when the 90% mark is reached.
+        if (!m_aiPlan.empty() && !m_aiNextReady && !m_aiNextTried && m_aiPlanPos * 10 >= m_aiPlanTotal * 8) {
+            m_aiNextTried = true;
+            int p90 = (m_aiPlanTotal * 9 + 9) / 10;        // first position that counts as 90% played
+            int lead = p90 - m_aiPlanPos;
+            if (lead > 0) {
+                bool ok = planAuto(pl, lead);
+                ++m_dbgSearches;
+                m_lastText = fmt::format("AI next {} from +{}t len={}t used={}", ok ? "plan" : "best",
+                                         lead, m_aiNextTotal, m_used);
+            }
+        }
+        // 90% played: follow the new route from here (it was built for exactly this point)
+        if (m_aiPlan.empty() || m_aiPlanPos * 10 >= m_aiPlanTotal * 9) {
+            if (m_aiNextReady && !m_aiPlan.empty()) {
+                m_aiPlan = std::move(m_aiNext);
+                m_aiPlanTotal = m_aiNextTotal;
+                m_aiPlanPos = 0;
+                m_aiNext.clear();
+            } else {                                        // no next route: plan from the real state
+                bool ok = planAuto(pl);
+                ++m_dbgSearches;
+                m_lastText = fmt::format("AI {} paths={} len={}t used={}", ok ? "plan" : "best",
+                                         c.autoPaths, m_aiPlanTotal, m_used);
+            }
+            m_aiNextReady = false;
+            m_aiNextTried = false;
         }
         bool h = m_aiHold;
         int acc = 0;
