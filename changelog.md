@@ -14,12 +14,12 @@ made it
 - fix the wave in dual keep holding when the mod is off
 # 1.1.4
 - fix some gamemodes don't buffer correctly
-# 1.1.5 beta
+# 1.1.5
 - improve cbf
-- input buffer now save late click [test]
+- input buffer now save late click
 - fix bugs on cube
-# 1.1.5 beta 2
 - refactor orb
 - add buffer visual
-# 1.1.5
 - fix D-block not detect properly
+# 1.1.6
+- improve auto
