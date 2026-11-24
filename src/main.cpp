@@ -5,7 +5,9 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/LevelEditorLayer.hpp>
 #include <Geode/modify/GameObject.hpp>
+#include <Geode/modify/EnhancedGameObject.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/GJEffectManager.hpp>
 #include <Geode/modify/RingObject.hpp>
 #include <Geode/modify/HardStreak.hpp>
 #include <Geode/binding/RingObject.hpp>
@@ -130,9 +132,21 @@ class $modify(BufHardStreak, HardStreak) {
     }
 };
 
+class $modify(BufEnhancedGameObject, EnhancedGameObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("EnhancedGameObject::activatedByPlayer", -1000000);
+    }
+
+    void activatedByPlayer(PlayerObject* player) {
+        if (g_engine.isSimulating()) return;           // ghost must never consume real orbs / portals
+        EnhancedGameObject::activatedByPlayer(player);
+    }
+};
+
 class $modify(BufEffectGameObject, EffectGameObject) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("EffectGameObject::triggerObject", -1000000);
+        (void)self.setHookPriority("EffectGameObject::triggerActivated", -1000000);
     }
 
     void triggerObject(GJBaseGameLayer* p0, int p1, const gd::vector<int>* p2) {
@@ -140,8 +154,42 @@ class $modify(BufEffectGameObject, EffectGameObject) {
             g_engine.simGravityPortal(this);
             return;
         }
-        if (m_objectID == 901) g_engine.onRealMoveTrigger(m_duration);   // move trigger
+        if (m_objectID == 901) g_engine.onRealMoveTrigger(this);        // move trigger fired
+        else if (m_objectID == 1616) g_engine.onRealStopTrigger(this);  // stop / pause / resume trigger
         EffectGameObject::triggerObject(p0, p1, p2);
+    }
+
+    void triggerActivated(float xPosition) {
+        if (g_engine.isSimulating()) return;
+        EffectGameObject::triggerActivated(xPosition);
+    }
+};
+
+class $modify(BufEffectManager, GJEffectManager) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("GJEffectManager::createMoveCommand", -1000000);
+    }
+
+    void createMoveCommand(
+        cocos2d::CCPoint pt, int groupID, float duration,
+        int easingType, float easingRate,
+        bool lockPlayerX, bool lockPlayerY,
+        bool lockCameraX, bool lockCameraY,
+        float moveModX, float moveModY,
+        int uniqueID, int controlID
+    ) {
+        if (!g_engine.isSimulating()) {
+            g_engine.onCreateMoveCommand(
+                this, pt, groupID, duration, easingType, easingRate,
+                lockPlayerX, lockPlayerY, lockCameraX, lockCameraY,
+                moveModX, moveModY, uniqueID, controlID
+            );
+        }
+        GJEffectManager::createMoveCommand(
+            pt, groupID, duration, easingType, easingRate,
+            lockPlayerX, lockPlayerY, lockCameraX, lockCameraY,
+            moveModX, moveModY, uniqueID, controlID
+        );
     }
 };
 
@@ -172,12 +220,16 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     bool pushButton(PlayerButton button) {
-        if (button == PlayerButton::Jump) g_engine.noteReceiver(this);
+        if (button == PlayerButton::Jump && !g_engine.isSimulating()) {
+            g_engine.noteRealButton(this, true);
+        }
         return PlayerObject::pushButton(button);
     }
 
     bool releaseButton(PlayerButton button) {
-        if (button == PlayerButton::Jump) g_engine.noteReceiver(this);
+        if (button == PlayerButton::Jump && !g_engine.isSimulating()) {
+            g_engine.noteRealButton(this, false);
+        }
         return PlayerObject::releaseButton(button);
     }
 
@@ -215,7 +267,30 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 
     void ringJump(RingObject* p0, bool p1) {
-        if (g_engine.isSimulating() && !g_engine.isSimPlayer(this)) return;
+        if (g_engine.isSimulating()) {
+            if (!g_engine.isSimPlayer(this) || !p0) return;
+            if (!g_engine.beforeSimRingJump(this, p0)) return;
+            // the ghost bounces on the real orb: restore all real-level activation flags after
+            const bool a0 = p0->m_activated;
+            const bool a1 = p0->m_activatedByPlayer1;
+            const bool a2 = p0->m_activatedByPlayer2;
+            const bool a3 = p0->m_isActivated;
+            const bool a4 = p0->m_isRingPoweredOn;
+            double vy = m_yVelocity;
+            bool ud = m_isUpsideDown;
+            bool dash = m_isDashing;
+            CCPoint pos = getPosition();
+            PlayerObject::ringJump(p0, p1);
+            p0->m_activated = a0;
+            p0->m_activatedByPlayer1 = a1;
+            p0->m_activatedByPlayer2 = a2;
+            p0->m_isActivated = a3;
+            p0->m_isRingPoweredOn = a4;
+            bool changed = m_yVelocity != vy || m_isUpsideDown != ud ||
+                           m_isDashing != dash || getPosition() != pos;
+            g_engine.afterSimRingJump(this, p0, changed);
+            return;
+        }
         PlayerObject::ringJump(p0, p1);
     }
 
@@ -238,8 +313,12 @@ class $modify(BufPlayerObject, PlayerObject) {
     }
 };
 
-// Orbs touched by a ghost player must not flash / pulse on screen.
+// Orbs touched by a ghost player must not flash / pulse / trigger on screen.
 class $modify(BufRingObject, RingObject) {
+    static void onModify(auto& self) {
+        (void)self.setHookPriority("RingObject::triggerActivated", -1000000);
+    }
+
     void powerOnObject(int state) {
         if (g_engine.isSimulating()) return;
         RingObject::powerOnObject(state);
@@ -248,6 +327,11 @@ class $modify(BufRingObject, RingObject) {
     void spawnCircle() {
         if (g_engine.isSimulating()) return;
         RingObject::spawnCircle();
+    }
+
+    void triggerActivated(float xPosition) {
+        if (g_engine.isSimulating()) return;
+        RingObject::triggerActivated(xPosition);
     }
 };
 
@@ -261,7 +345,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     bool canBeActivatedByPlayer(PlayerObject* p0, EffectGameObject* p1) {
         if (g_engine.isSimulating()) {
-            return g_engine.canSimRing(p0, p1);
+            return g_engine.canSimRingTouch(p0, p1);
         }
         return GJBaseGameLayer::canBeActivatedByPlayer(p0, p1);
     }
@@ -281,27 +365,57 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
         if (g_engine.isSimulating()) {
-            g_engine.simTouchObjects(player, vec, objectsCount);   // gravity / speed portals, unknown objects
+            struct MovedObj {
+                GameObject* obj;
+                CCPoint pos;
+                CCPoint lastPos;
+            };
+            thread_local gd::vector<GameObject*> cand;
             thread_local gd::vector<GameObject*> extra;
-            thread_local std::vector<std::pair<GameObject*, CCPoint>> moved;
+            thread_local std::vector<MovedObj> moved;
+            cand.clear();
             extra.clear();
             moved.clear();
-            if (extra.capacity() < static_cast<size_t>(objectsCount)) {
-                extra.reserve(objectsCount);
+            if (cand.capacity() < static_cast<size_t>(objectsCount) + 32) {
+                cand.reserve(static_cast<size_t>(objectsCount) + 32);
             }
-            for (int i = 0; i < objectsCount; i++) {
-                GameObject* obj = vec->at(i);
-                if (!obj) continue;
-                if (obj->m_groups && obj->m_groups->at(0) != 0) {
-                    CCPoint off;
-                    auto st = g_engine.simMove(obj, off);
+            for (int i = 0; i < objectsCount; ++i) {
+                if (GameObject* obj = vec->at(i)) cand.push_back(obj);
+            }
+            g_engine.beginSimCollision(player);
+            // Also pull in objects from moving groups that slide horizontally into this section
+            g_engine.appendMovingGroupObjects(this, player, cand);
+            int candCount = static_cast<int>(cand.size());
+            if (extra.capacity() < static_cast<size_t>(candCount)) {
+                extra.reserve(candCount);
+            }
+            // 1. place every moving object at its predicted position & lastPosition for the ghost's time
+            for (int i = 0; i < candCount; ++i) {
+                GameObject* obj = cand[i];
+                if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
+                if (obj->m_groups && obj->m_groupCount > 0) {
+                    CCPoint off, prevOff;
+                    auto st = g_engine.simMove(obj, off, prevOff);
                     if (st == buf::Engine::MoveState::Predicted) {
-                        moved.emplace_back(obj, obj->getPosition());   // restored right after the check
-                        obj->setPosition(obj->getPosition() + off);
+                        if (off.x != 0.f || off.y != 0.f || prevOff.x != 0.f || prevOff.y != 0.f) {
+                            CCPoint orig = obj->getPosition();
+                            moved.push_back({obj, orig, obj->m_lastPosition});
+                            obj->setPosition(orig + off);
+                            obj->m_lastPosition = orig + prevOff;
+                            obj->m_isObjectRectDirty = true;
+                            obj->m_isOrientedBoxDirty = true;
+                        }
                     } else if (st == buf::Engine::MoveState::Unknown) {
-                        g_engine.flagMovingObject();       // moving, speed unknown: do not trust it
+                        g_engine.flagMovingObject();       // moving, cannot be predicted: do not trust it
                     }
                 }
+            }
+            // 2. gravity / speed portals, D/J/S/H blocks, unknown objects
+            g_engine.simTouchObjects(player, &cand, candCount);
+            // 3. the game's own collision on what the ghost may touch
+            for (int i = 0; i < candCount; ++i) {
+                GameObject* obj = cand[i];
+                if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
                 auto type = obj->m_objectType;
                 if (type == GameObjectType::Solid ||
                     (g_engine.dBlockSim() && buf::isSpecialBlock(obj)) ||             // D / J / S / H blocks, by ID
@@ -312,7 +426,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     type == GameObjectType::NormalGravityPortal ||
                     type == GameObjectType::InverseGravityPortal ||
                     type == GameObjectType::GravityTogglePortal ||
-                    geode::cast::typeinfo_cast<RingObject*>(obj)) {
+                    buf::Engine::isSimOrb(obj)) {
                     extra.push_back(obj);
                 }
             }
@@ -327,6 +441,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     pr.size.width += 120.f;
                     pr.size.height += 120.f;
                     for (auto* o : geode::cocos::CCArrayExt<GameObject*>(pl2->m_collisionBlocks)) {
+                        if (!o || o->m_isDisabled || o->m_isDisabled2 || o->m_isGroupDisabled) continue;
                         if (!buf::isDynamicCollisionBlock(o)) continue;
                         bool dup = false;
                         for (size_t k = 0; k < extra.size(); ++k) {
@@ -340,8 +455,13 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
                     }
                 }
             }
-            GJBaseGameLayer::collisionCheckObjects(player, &extra, extra.size(), dt);
-            for (auto& mv : moved) mv.first->setPosition(mv.second);
+            GJBaseGameLayer::collisionCheckObjects(player, &extra, static_cast<int>(extra.size()), dt);
+            for (auto& mv : moved) {
+                mv.obj->setPosition(mv.pos);
+                mv.obj->m_lastPosition = mv.lastPos;
+                mv.obj->m_isObjectRectDirty = true;
+                mv.obj->m_isOrientedBoxDirty = true;
+            }
             moved.clear();
             return;
         }
@@ -353,9 +473,7 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
 
     void playerTouchedRing(PlayerObject* player, RingObject* ring) {
         if (g_engine.isSimulating()) {
-            if (g_engine.canSimRing(player, ring)) {
-                player->ringJump(ring, true);
-            }
+            g_engine.simTouchedRing(player, ring);
             return;
         }
         GJBaseGameLayer::playerTouchedRing(player, ring);

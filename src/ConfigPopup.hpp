@@ -550,8 +550,10 @@ protected:
                 number("Min budget (ticks)", &c.minBudget, 50, 5000),
                 number("Noclip memory (ticks)", &c.noclipTicks, 0, 5000),
                 number("Fail-open frames", &c.failOpen, 1, 60),
+                number("Safety margin (ticks)", &c.safeMargin, 0, 8),
             };
             note = "Ship/Wave look: a hold/release must survive this many ticks.\n"
+                   "Safety margin: a delayed input lands this far inside the safe window, not on its edge.\n"
                    "If no delay saves it, a late rescue is tried, else the input goes through raw.\n"
                    "CBF support: with Click Between Frames on, it splits the steps (own sub-tick is off).";
         } else if (tab == 5) {

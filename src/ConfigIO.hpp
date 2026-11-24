@@ -36,7 +36,7 @@ inline std::vector<Key> const& keys() {
                     I{"lineWidth", 2, 40, 8}, I{"pathHorizon", 20, 300, 90}, I{"pathEvery", 1, 60, 6},
                     I{"pathBudget", 200, 20000, 2500}, I{"trajOpacity", 10, 100, 100}, I{"settle", 1, 30, 6},
                     I{"airHorizon", 10, 300, 45}, I{"robotHold", 1, 60, 18}, I{"gainClick", 1, 60, 6},
-                    I{"minBudget", 50, 5000, 300}, I{"noclipTicks", 0, 5000, 480}, I{"failOpen", 1, 60, 4},
+                    I{"minBudget", 50, 5000, 300}, I{"noclipTicks", 0, 5000, 480}, I{"failOpen", 1, 60, 4}, I{"safeMargin", 0, 8, 1},
                     I{"waveUp", 3000, 8000, 4510}, I{"waveDown", 3000, 8000, 4490}, I{"miniUp", 3000, 8500, 6343},
                     I{"miniDown", 3000, 8500, 6343}, I{"trajectory", 20, 400, 120}, I{"shipImminent", 2, 120, 16},
                     I{"waveImminent", 2, 120, 10}, I{"holdGain", 1, 30, 4}, I{"autoHorizon", 20, 2400, 70},
