@@ -54,11 +54,19 @@ class $modify(BufPlayLayer, PlayLayer) {
         (void)self.setHookPriority("PlayLayer::flipGravity", -1000000);
     }
 
+#if defined(GEODE_COMP_GD_VERSION) && GEODE_COMP_GD_VERSION >= 22090
+    bool init(GJGameLevel* level, bool dontCreateObjects) {
+        if (!PlayLayer::init(level, dontCreateObjects)) return false;
+        g_engine.init();
+        return true;
+    }
+#else
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         g_engine.init();
         return true;
     }
+#endif
 
     void resetLevel() {
         g_engine.onReset();
@@ -149,7 +157,7 @@ class $modify(BufEffectGameObject, EffectGameObject) {
         (void)self.setHookPriority("EffectGameObject::triggerActivated", -1000000);
     }
 
-    void triggerObject(GJBaseGameLayer* p0, int p1, const gd::vector<int>* p2) {
+    void triggerObject(GJBaseGameLayer* p0, int p1, buf::GdVec<int> const* p2) {
         if (g_engine.isSimulating()) {
             g_engine.simGravityPortal(this);
             return;
@@ -363,15 +371,15 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
         if (track) g_engine.endLate();                        // late rescue: the press is in, finish the rewind
     }
 
-    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int objectsCount, float dt) {
+    void collisionCheckObjects(PlayerObject* player, buf::GdVec<GameObject*>* vec, int objectsCount, float dt) {
         if (g_engine.isSimulating()) {
             struct MovedObj {
                 GameObject* obj;
                 CCPoint pos;
                 CCPoint lastPos;
             };
-            thread_local gd::vector<GameObject*> cand;
-            thread_local gd::vector<GameObject*> extra;
+            thread_local buf::GdVec<GameObject*> cand;
+            thread_local buf::GdVec<GameObject*> extra;
             thread_local std::vector<MovedObj> moved;
             cand.clear();
             extra.clear();

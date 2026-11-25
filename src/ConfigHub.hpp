@@ -40,7 +40,11 @@ inline web::WebFuture request(std::string method, std::string url, matjson::Valu
                               std::string const& token = "") {
     web::WebRequest r;
     r.userAgent("input-buffer-mod");
+#if BUF_GEODE_V6
+    r.timeout(asp::Duration::fromSecs(15));
+#else
     r.timeout(std::chrono::seconds(15));
+#endif
     if (!token.empty()) r.header("x-token", token);
     if (body) r.bodyJSON(*body);
     return r.send(std::move(method), std::move(url));
@@ -182,14 +186,14 @@ protected:
         opts.defaultPath = cfgio::configsDir();
         opts.filters.push_back({"Config", {"*.json"}});
         m_pick.spawn(file::pick(file::PickMode::OpenFile, std::move(opts)), [this](file::PickResult r) {
-            if (r.isErr()) { setState(r.unwrapErr()); return; }
+            if (r.isErr()) { setState(fmt::format("{}", r.unwrapErr())); return; }
             if (!r.unwrap()) return;
             auto path = *r.unwrap();
             auto json = cfgio::readFile(path);
             if (json.isErr()) { setState(json.unwrapErr()); return; }
             auto clean = cfgio::sanitize(json.unwrap());
             if (clean.isErr()) { setState(clean.unwrapErr()); return; }
-            setValues(std::move(clean).unwrap(), path.filename().string());
+            setValues(std::move(clean).unwrap(), cfgio::fileNameStr(path));
         });
     }
 
@@ -372,7 +376,7 @@ protected:
         auto root = cfgio::wrap(m_values);                        // what the preview showed is what gets saved
         auto path = cfgio::configsDir() / fmt::format("{}-{}.json", m_id, cfgio::safeName(m_name));
         auto w = file::writeString(path, root.dump(2));
-        setState(w.isOk() ? "Saved: " + path.filename().string() : "Couldn't save the file");
+        setState(w.isOk() ? "Saved: " + cfgio::fileNameStr(path) : "Couldn't save the file");
         auto pv = cfgio::preview(m_values);
         createQuickPopup(
             "Apply config?",

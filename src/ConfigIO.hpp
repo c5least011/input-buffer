@@ -2,7 +2,13 @@
 #include <Geode/Geode.hpp>
 #include <Geode/utils/file.hpp>
 #include <algorithm>
+#if __has_include(<asp/fs/Path.hpp>)
+#define BUF_GEODE_V6 1
+#include <asp/fs/Path.hpp>
+#else
+#define BUF_GEODE_V6 0
 #include <filesystem>
+#endif
 #include <string>
 #include <vector>
 #include "Config.hpp"
@@ -142,16 +148,47 @@ inline Preview preview(matjson::Value const& values) {
     return p;
 }
 
-inline std::filesystem::path configsDir() {
-    auto dir = geode::Mod::get()->getSaveDir() / "configs";
+#if BUF_GEODE_V6
+using Path = asp::fs::Path;
+
+inline void createDirAll(Path const& dir) {
+    (void)geode::utils::file::createDirectoryAll(dir);
+}
+
+inline std::string pathStr(Path const& p) {
+    return std::string(p.string());
+}
+
+inline std::string fileNameStr(Path const& p) {
+    auto fn = p.filename();
+    return fn ? std::string(fn->string()) : std::string(p.string());
+}
+#else
+using Path = std::filesystem::path;
+
+inline void createDirAll(Path const& dir) {
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
+}
+
+inline std::string pathStr(Path const& p) {
+    return geode::utils::string::pathToString(p);
+}
+
+inline std::string fileNameStr(Path const& p) {
+    return p.filename().string();
+}
+#endif
+
+inline Path configsDir() {
+    auto dir = geode::Mod::get()->getSaveDir() / "configs";
+    createDirAll(dir);
     return dir;
 }
 
-inline geode::Result<matjson::Value> readFile(std::filesystem::path const& path) {
+inline geode::Result<matjson::Value> readFile(Path const& path) {
     auto text = geode::utils::file::readString(path);
-    if (text.isErr()) return geode::Err(text.unwrapErr());
+    if (text.isErr()) return geode::Err(fmt::format("{}", text.unwrapErr()));
     auto json = matjson::Value::parse(text.unwrap());
     if (json.isErr()) return geode::Err("Not valid JSON");
     return geode::Ok(std::move(json).unwrap());

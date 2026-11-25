@@ -16,6 +16,12 @@ using namespace geode::prelude;
 
 namespace buf {
 
+#if defined(GEODE_COMP_GD_VERSION) && GEODE_COMP_GD_VERSION >= 22090
+template <class T> using GdVec = std::vector<T>;
+#else
+template <class T> using GdVec = gd::vector<T>;
+#endif
+
 // ---------------------------------------------------------------------------
 // Engine: input interception + ghost-player prediction.
 //
@@ -649,7 +655,7 @@ public:
     // The collision hook hands us the objects near a ghost player. Portals & special blocks
     // (D/J/S/H) the game would apply with side effects (or not at all) are applied here, by
     // geometry, with no visuals and without touching any real object state.
-    void simTouchObjects(PlayerObject* player, gd::vector<GameObject*>* vec, int count) {
+    void simTouchObjects(PlayerObject* player, GdVec<GameObject*>* vec, int count) {
         PlayLayer* pl = PlayLayer::get();
         if (!m_simulating || !pl || !isSimPlayer(player) || !vec) return;
         int who = player == m_stepObj[1] ? 1 : 0;
@@ -1033,7 +1039,7 @@ public:
     // If an active or simulated move trigger slides a group horizontally into the ghost's current
     // collision section from another X section, pull those group objects into `cand` so the ghost
     // collides with the real final gap after the horizontal move!
-    void appendMovingGroupObjects(GJBaseGameLayer* layer, PlayerObject* player, gd::vector<GameObject*>& cand) {
+    void appendMovingGroupObjects(GJBaseGameLayer* layer, PlayerObject* player, GdVec<GameObject*>& cand) {
         if (!cfg().moveDetect || !layer || !player) return;
         if (m_moves.empty() && m_info[m_curSlot].simMoves.empty()) return;
 
@@ -1096,7 +1102,7 @@ public:
     float moveFresh() const { return 40.f * std::max(1e-4f, stepDt()); }
 
     // real game, every collision pass of player 1 (fallback for Follow / AreaMove / Practice checkpoints)
-    void observeObjects(gd::vector<GameObject*>* vec, int count) {
+    void observeObjects(GdVec<GameObject*>* vec, int count) {
         if (!cfg().moveDetect || !vec) return;
         if (m_moveTrk.size() > 4000) m_moveTrk.clear();
         double fresh = moveFresh();
@@ -1954,8 +1960,12 @@ private:
         sim->m_stateNoAutoJump = src->m_stateNoAutoJump;
         sim->m_stateHitHead = src->m_stateHitHead;
         sim->m_stateFlipGravity = src->m_stateFlipGravity;
+#if defined(GEODE_COMP_GD_VERSION) && GEODE_COMP_GD_VERSION >= 22090
+        sim->m_stateNoWallPush = src->m_stateNoWallPush;
+#else
         sim->m_stateNoStickX = src->m_stateNoStickX;
         sim->m_stateNoStickY = src->m_stateNoStickY;
+#endif
         sim->m_stateBoostX = src->m_stateBoostX;
         sim->m_stateBoostY = src->m_stateBoostY;
         sim->m_stateScale = src->m_stateScale;

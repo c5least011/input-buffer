@@ -280,7 +280,7 @@ protected:
         m_statusLabel->setWidth(600.f);
         m_page->addChild(m_statusLabel);
         m_statusLabel->setPosition(ccp(0.f, -40.f));
-        addNote("Default folder: " + geode::utils::string::pathToString(cfgio::configsDir()), -100.f);
+        addNote("Default folder: " + cfgio::pathStr(cfgio::configsDir()), -100.f);
     }
 
     void doExport() {
@@ -289,17 +289,16 @@ protected:
         m_pick.spawn(
             geode::utils::file::pick(geode::utils::file::PickMode::OpenFolder, std::move(opts)),
             [this](geode::utils::file::PickResult r) {
-                std::filesystem::path dir = cfgio::configsDir();
+                cfgio::Path dir = cfgio::configsDir();
                 std::string note;
                 if (r.isErr()) note = " (folder picker failed, used the default folder)";
                 else if (!r.unwrap()) return;                       // cancelled
                 else dir = *r.unwrap();
-                std::error_code ec;
-                std::filesystem::create_directories(dir, ec);
+                cfgio::createDirAll(dir);
                 auto path = dir / fmt::format("buf-config-{}.json", static_cast<long long>(std::time(nullptr)));
                 auto w = geode::utils::file::writeString(path, cfgio::exportJson().dump(2));
-                setStatus(w.isOk() ? "Exported: " + geode::utils::string::pathToString(path) + note
-                                   : "Export failed: " + w.unwrapErr());
+                setStatus(w.isOk() ? "Exported: " + cfgio::pathStr(path) + note
+                                   : fmt::format("Export failed: {}", w.unwrapErr()));
             }
         );
     }
@@ -311,14 +310,14 @@ protected:
         m_pick.spawn(
             geode::utils::file::pick(geode::utils::file::PickMode::OpenFile, std::move(opts)),
             [this](geode::utils::file::PickResult r) {
-                if (r.isErr()) { setStatus("Picker failed: " + r.unwrapErr()); return; }
+                if (r.isErr()) { setStatus(fmt::format("Picker failed: {}", r.unwrapErr())); return; }
                 if (!r.unwrap()) return;
                 auto json = cfgio::readFile(*r.unwrap());
                 if (json.isErr()) { setStatus("Import failed: " + json.unwrapErr()); return; }
                 cfgio::backup();
                 auto n = cfgio::apply(json.unwrap());
                 if (n.isErr()) { setStatus("Import failed: " + n.unwrapErr()); return; }
-                m_status = fmt::format("Imported {} settings from {}", n.unwrap(), r.unwrap()->filename().string());
+                m_status = fmt::format("Imported {} settings from {}", n.unwrap(), cfgio::fileNameStr(*r.unwrap()));
                 buildPage(7);
             }
         );
