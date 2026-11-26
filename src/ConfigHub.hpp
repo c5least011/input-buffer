@@ -312,10 +312,14 @@ protected:
         label(m_body, head, "chatFont.fnt", .5f, ccp(0.f, cy + h / 2.f + 9.f));
 
         auto bg = CCLayerColor::create({0, 0, 0, 110}, w, h);
-        bg->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        bg->ignoreAnchorPointForPosition(false);
+        bg->setAnchorPoint({.5f, .5f});
+        bg->setPosition(ccp(0.f, cy));
         m_body->addChild(bg);
         auto scroll = ScrollLayer::create({w, h});
-        scroll->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        scroll->ignoreAnchorPointForPosition(false);
+        scroll->setAnchorPoint({.5f, .5f});
+        scroll->setPosition(ccp(0.f, cy));
         m_body->addChild(scroll);
         float total = std::max(h, static_cast<float>(pv.changed.size()) * lineH + 6.f);
         scroll->m_contentLayer->setContentSize({w, total});
@@ -351,6 +355,7 @@ protected:
 
     void refreshMeta() {
         m_meta->setString(fmt::format("by {}   |   {} likes   |   {} downloads", m_author, m_likes, m_downloads).c_str());
+        m_meta->limitLabelWidth(330.f, .6f, .35f);
         if (m_likeSpr) m_likeSpr->setString(m_liked ? "Unlike" : "Like");
     }
 

@@ -123,6 +123,7 @@ protected:
         label->setScale(.27f);
         label->setOpacity(190);
         label->setAlignment(kCCTextAlignmentCenter);
+        label->limitLabelWidth(396.f, .27f, .14f);
         m_page->addChild(label);
         label->setPosition(ccp(0.f, y));
     }
@@ -187,11 +188,15 @@ protected:
         float cy = 14.f;                                    // list centre, relative to the popup centre
 
         auto bg = CCLayerColor::create({0, 0, 0, 110}, w, h);
-        bg->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        bg->ignoreAnchorPointForPosition(false);
+        bg->setAnchorPoint({.5f, .5f});
+        bg->setPosition(ccp(0.f, cy));
         m_page->addChild(bg);
 
         auto scroll = ScrollLayer::create({w, h});
-        scroll->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        scroll->ignoreAnchorPointForPosition(false);
+        scroll->setAnchorPoint({.5f, .5f});
+        scroll->setPosition(ccp(0.f, cy));
         m_page->addChild(scroll);
 
         float total = std::max(h, static_cast<float>(lines.size()) * lineH + 8.f);
@@ -223,15 +228,16 @@ protected:
         auto clear = CCMenuItemSpriteExtra::create(
             sprite, this, menu_selector(ConfigPopup::onClearLog)
         );
-        m_buttonMenu->addChildAtPosition(clear, Anchor::Center, ccp(150.f, -95.f));
+        m_buttonMenu->addChildAtPosition(clear, Anchor::Center, ccp(w / 2.f - 36.f, -88.f));
         m_pageButtons.push_back(clear);
 
         auto dbg = CCLabelBMFont::create(g_engine.inputInfo().c_str(), "chatFont.fnt");
         dbg->setScale(.4f);
         dbg->setAnchorPoint({0.f, .5f});
         dbg->setOpacity(200);
+        dbg->limitLabelWidth(w, .4f, .2f);
         m_page->addChild(dbg);
-        dbg->setPosition(ccp(-190.f, -110.f));
+        dbg->setPosition(ccp(-w / 2.f, -114.f));
 
         std::string status = std::to_string(lines.size()) + "/" + std::to_string(Engine::kLogMax) +
                              " lines";
@@ -240,8 +246,9 @@ protected:
         note->setScale(.27f);
         note->setOpacity(190);
         note->setAnchorPoint({0.f, .5f});
+        note->limitLabelWidth(w - 86.f, .27f, .18f);
         m_page->addChild(note);
-        note->setPosition(ccp(-190.f, -97.f));
+        note->setPosition(ccp(-w / 2.f, -88.f));
     }
 
     // ------------------------------------------------------------ Config tab
@@ -259,7 +266,7 @@ protected:
 
     void buildConfigPage() {
         for (int s = 0; s < 2; ++s) {
-            addButton(s == 0 ? "Local" : "Explore", s == m_sub ? .55f : .45f, ccp(-35.f + s * 70.f, 86.f), [this, s] {
+            addButton(s == 0 ? "Local" : "Explore", s == m_sub ? .55f : .45f, ccp(-38.f + s * 76.f, 86.f), [this, s] {
                 m_sub = s;
                 buildPage(7);
             });
@@ -278,9 +285,10 @@ protected:
         m_statusLabel = CCLabelBMFont::create(m_status.c_str(), "chatFont.fnt");
         m_statusLabel->setScale(.55f);
         m_statusLabel->setWidth(600.f);
+        m_statusLabel->setAlignment(kCCTextAlignmentCenter);
         m_page->addChild(m_statusLabel);
         m_statusLabel->setPosition(ccp(0.f, -40.f));
-        addNote("Default folder: " + cfgio::pathStr(cfgio::configsDir()), -100.f);
+        addNote("Default folder: " + cfgio::pathStr(cfgio::configsDir()), -104.f);
     }
 
     void doExport() {
@@ -387,16 +395,16 @@ protected:
         m_draft = m_query;
         m_search->setCallback([this](std::string const& s) { if (!m_building) m_draft = s; });
         m_page->addChild(m_search);
-        m_search->setPosition(ccp(-138.f, 62.f));
+        m_search->setPosition(ccp(-136.f, 62.f));
 
-        addButton("Search", .5f, ccp(-40.f, 62.f), [this] { search(); });
-        addButton(m_sortTop ? "Top" : "New", .5f, ccp(10.f, 62.f), [this] {
+        addButton("Search", .5f, ccp(-42.f, 62.f), [this] { search(); });
+        addButton(m_sortTop ? "Top" : "New", .5f, ccp(18.f, 62.f), [this] {
             m_sortTop = !m_sortTop;
             m_pageNo = 1;
             fetchList();
             buildPage(7);
         });
-        addButton("Post", .5f, ccp(160.f, 62.f), [this] {
+        addButton("Post", .5f, ccp(172.f, 62.f), [this] {
             if (hub::userKey().empty()) {
                 FLAlertLayer::create("Post", "Log in to your Geometry Dash account to post configs.", "OK")->show();
                 return;
@@ -406,11 +414,15 @@ protected:
 
         constexpr float w = 392.f, h = 112.f, rowH = 30.f, cy = -10.f;
         auto bg = CCLayerColor::create({0, 0, 0, 110}, w, h);
-        bg->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        bg->ignoreAnchorPointForPosition(false);
+        bg->setAnchorPoint({.5f, .5f});
+        bg->setPosition(ccp(0.f, cy));
         m_page->addChild(bg);
 
         auto scroll = ScrollLayer::create({w, h});
-        scroll->setPosition(ccp(-w / 2.f, cy - h / 2.f));
+        scroll->ignoreAnchorPointForPosition(false);
+        scroll->setAnchorPoint({.5f, .5f});
+        scroll->setPosition(ccp(0.f, cy));
         m_page->addChild(scroll);
 
         float total = std::max(h, static_cast<float>(m_entries.size()) * rowH);
@@ -455,10 +467,11 @@ protected:
         bar->setPosition(ccp(w / 2.f + 8.f, cy));
         m_page->addChild(bar);
 
-        addButton("<", .5f, ccp(-40.f, -84.f), [this] { gotoPage(m_pageNo - 1); });
-        addButton(">", .5f, ccp(40.f, -84.f), [this] { gotoPage(m_pageNo + 1); });
+        addButton("<", .5f, ccp(-82.f, -84.f), [this] { gotoPage(m_pageNo - 1); });
+        addButton(">", .5f, ccp(82.f, -84.f), [this] { gotoPage(m_pageNo + 1); });
         auto pg = CCLabelBMFont::create(fmt::format("Page {}/{}  ({} configs)", m_pageNo, m_pages, m_total).c_str(), "chatFont.fnt");
         pg->setScale(.5f);
+        pg->limitLabelWidth(124.f, .5f, .32f);
         m_page->addChild(pg);
         pg->setPosition(ccp(0.f, -84.f));
         addNote(hub::playerName().empty() ? std::string("Not logged in (needed to post and like)") : "Logged in as " + hub::playerName(), -108.f);
@@ -549,10 +562,8 @@ protected:
                 number("Min budget (ticks)", &c.minBudget, 50, 5000),
                 number("Noclip memory (ticks)", &c.noclipTicks, 0, 5000),
                 number("Fail-open frames", &c.failOpen, 1, 60),
-                number("Safety margin (ticks)", &c.safeMargin, 0, 8),
             };
             note = "Ship/Wave look: a hold/release must survive this many ticks.\n"
-                   "Safety margin: a delayed input lands this far inside the safe window, not on its edge.\n"
                    "If no delay saves it, a late rescue is tried, else the input goes through raw.\n"
                    "CBF support: with Click Between Frames on, it splits the steps (own sub-tick is off).";
         } else if (tab == 5) {

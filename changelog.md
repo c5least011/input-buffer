@@ -23,3 +23,6 @@ made it
 - fix D-block not detect properly
 # 1.1.6
 - improve auto
+# 1.1.7
+- update to GD 2.2091 / Geode v6.0.0
+- fix Log and Config UI alignment

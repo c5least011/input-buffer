@@ -16,12 +16,6 @@ using namespace geode::prelude;
 
 namespace buf {
 
-#if defined(GEODE_COMP_GD_VERSION) && GEODE_COMP_GD_VERSION >= 22090
-template <class T> using GdVec = std::vector<T>;
-#else
-template <class T> using GdVec = gd::vector<T>;
-#endif
-
 // ---------------------------------------------------------------------------
 // Engine: input interception + ghost-player prediction.
 //
@@ -74,21 +68,7 @@ public:
     };
 
 private:
-    static constexpr int kSlots = 22;
-
-    // Simulated (upcoming, not-yet-triggered) move command started when the ghost crosses a move trigger
-    struct SimMove {
-        int group = 0;
-        CCPoint amp;                   // world-unit offset
-        double start = 0.0;            // simulated seconds (SlotInfo::simTime) when crossed
-        double len = 0.0;              // duration in seconds
-        int easing = 0;
-        float rate = 2.f;
-        bool lockX = false, lockY = false;
-        float modX = 1.f, modY = 1.f;
-        float startP1X = 0.f, startP1Y = 0.f;
-        bool unsupported = false;
-    };
+    static constexpr int kSlots = 14;
 
     struct SlotInfo {
         bool holding[2] = {false, false};
@@ -96,13 +76,7 @@ private:
         int groundTicks = 0;
         bool unknown = false;          // touched something we cannot predict
         int ticks = 0;                 // ticks simulated in this slot
-        double simTime = 0.0;          // simulated seconds elapsed since search start
-        double prevSimTime = 0.0;      // simTime at the previous tick (for moving object m_lastPosition)
-        float firstScale = 1.f;        // part of a tick the NEXT step simulates (CBF: the rest of the running tick)
         std::vector<int> touched;      // portals already applied (uniqueID*2 + player)
-        std::vector<int> usedRings;    // orbs activated in THIS slot (uniqueID*2 + player)
-        std::vector<int> simTrigIDs;   // upcoming x-move triggers already crossed in THIS slot
-        std::vector<SimMove> simMoves; // upcoming x-move commands started during THIS slot's simulation
     };
 
     enum class Layout { Solo, DualSolo, TwoPlayer };
@@ -154,11 +128,11 @@ private:
     PlayerObject* m_stepObj[2] = {nullptr, nullptr};
     bool m_stepEdge[2] = {false, false};   // this tick presses the button (false -> true)
     // Everything the ghost knows about orbs lives in m_orb (see the "orbs" block below).
+    struct RingEntry { RingObject* obj; float x; };
     struct OrbState {
+        std::vector<RingEntry> rings;      // every orb of the level, sorted by x (see buildRings)
         bool done[2] = {false, false};     // an orb already reacted to this step's click
         bool used = false;                 // the run being simulated activated an orb (see orbBegin)
-        int hitTick = -1;                  // slot tick when the first orb in this run activated
-        bool allowBuffer = false;          // allow GD-style held-in-air orb buffering (m_stateRingJump)
         bool enabled = true;               // false while the late search runs: a rescue never uses an orb
         long seen = 0;                     // stats for the Physics page: orbs the ghost touched,
         long hit = 0;                      // ...that reacted to the clicked tick,
@@ -180,7 +154,7 @@ private:
     bool m_phys[2] = {false, false};   // what your finger does
     bool m_game[2] = {false, false};   // what the game has been told
     bool m_supp[2] = {false, false};
-    struct Pend { long tick; bool push; float frac = 1.f; int saved = 0; bool flag = true; };   // saved = ticks it was held back, flag = isPlayer1 of the original event
+    struct Pend { long tick; bool push; float frac = 1.f; int saved = 0; };   // saved = ticks it was held back
     std::deque<Pend> m_pend[2];        // events held back (only ever filled by a rescue)
     long m_arr[2] = {0, 0};            // arrival tick of the last held-back event
     long m_now = 0;                    // physics ticks started so far
@@ -193,56 +167,7 @@ private:
         bool hasVel = false;
     };
     std::unordered_map<int, MoveTrack> m_moveTrk;
-    int m_fallbackMovingCount = 0;                 // >0 only when at least one non-trigger-tracked relevant object is moving
-    // Move triggers, read straight from GJEffectManager::createMoveCommand (already active)
-    // and EffectGameObject (upcoming x-activated triggers). The ghost computes the exact
-    // eased offset at its own simulated time ONCE per tick into an O(1) generation-stamped table.
-    struct MoveCmd {
-        int group = 0;
-        int controlID = 0;
-        CCPoint amp;                   // full offset of the move (world units, straight from GD)
-        double start = 0.0;            // m_secClock (seconds) when it started
-        double len = 0.0;              // duration in seconds (0 = instant)
-        int easing = 0;
-        float rate = 2.f;
-        bool lockX = false, lockY = false;
-        float modX = 1.f, modY = 1.f;
-        bool unsupported = false;      // camera lock / stopped / dynamic: cannot be predicted
-    };
-    struct MoveCacheEntry {
-        CCPoint off;
-        CCPoint prevOff;
-        bool unsupported = false;
-    };
-    struct GroupObj {
-        GameObject* obj = nullptr;
-        float baseX = 0.f;
-    };
-    static constexpr int kMaxFastGroup = 10000;
-    std::vector<MoveCmd> m_moves;                  // running (real) moves
-    std::unordered_set<int> m_firedMoveIDs;        // uniqueIDs of real move triggers already fired
-    struct MoveTrig { EffectGameObject* obj; float x; int uniqueID; };
-    std::vector<MoveTrig> m_moveTrigs;             // x-activated move triggers of the level, sorted by x
-    std::vector<uint32_t> m_moveGen;               // per-group generation stamp for O(1) tick cache
-    std::vector<MoveCacheEntry> m_moveCache;       // per-group cached offset for current ghost tick
-    std::unordered_map<int, MoveCacheEntry> m_moveCacheHi; // overflow for groupID >= kMaxFastGroup
-    uint32_t m_curMoveGen = 1;
-    bool m_tickHasMove = false;                    // true iff any active/sim move exists on this ghost tick
-    std::vector<int> m_tickHorizGroups;            // groups with |off.x| > 15 on this ghost tick
-    std::unordered_map<int, std::vector<GroupObj>> m_groupColCache; // per-search collidable objects per moving group (sorted by x)
-    std::unordered_set<int> m_activeCmdGroups;     // groups currently driven by m_moves (skip in fallback observeObjects)
-    float m_ghostPlayerX = 0.f;                    // x of the ghost being collision-checked
-    float m_ghostPlayerY = 0.f;
-    float m_prevGhostPlayerX = 0.f;                // x/y of the ghost at the previous tick
-    float m_prevGhostPlayerY = 0.f;
-    float m_realP1X = 0.f;                         // x/y of real player 1 when the search started
-    float m_realP1Y = 0.f;
-    // CBF: where player 1 stood when the running tick started, and how far the tick before moved it
-    float m_tickStartX = 0.f;
-    float m_prevTickDx = 0.f;
-    float m_loadScale = 1.f;                       // first step of a decision search (see SlotInfo::firstScale)
-    double m_clock = 0.0;              // game time = sum of the dt of every real physics step (60fps units)
-    double m_secClock = 0.0;           // game time in seconds (= sum of dt / 60, already timeWarp-scaled)
+    double m_clock = 0;                // game time = sum of the dt of every real physics step
     float m_stepDtNow = 0.f;
     float m_dtScale = 1.f;             // ghost: part of a tick to simulate (sub-tick click)
     bool m_partial = false;            // ghost: movement only, no collision check (first half of a split tick)
@@ -271,31 +196,28 @@ private:
     bool m_firing = false;
     float m_load = 0.f;                // recent search load (spam) -> smaller budgets
 
-    // autoplay planner + memory (2D spatial cells so different heights never alias)
+    // autoplay planner + memory
     struct AiCell { float bad[2] = {0.f, 0.f}; };      // [0] release, [1] hold
-    struct AiStep { int64_t cell; bool hold; int tick; };
-    std::unordered_map<int64_t, AiCell> m_ai;
+    struct AiStep { int cell; bool hold; int tick; };
+    std::unordered_map<int, AiCell> m_ai;
     std::deque<AiStep> m_aiTrail;
-    std::pair<int64_t, bool> m_aiLastForgiven{std::numeric_limits<int64_t>::min(), false};
+    std::pair<int, bool> m_aiLastForgiven{std::numeric_limits<int>::min(), false};
     int m_aiTick = 0;
     bool m_aiHold = false;
     int m_aiHoldLeft = 0;
     int m_aiDeaths = 0;
     int m_aiHorizon = 70;
-    int m_aiVerifyCounter = 0;
-    Mode m_aiPlanMode = M_CUBE;
     bool m_autoWas = false;
     std::unordered_set<uint64_t> m_failMemo;
     std::vector<int> m_levels;
     struct AiSeg {
-        bool hold = false;
-        int seg = 1;
-        int holdTicks = 1;             // ticks within `seg` to hold (click modes tap cleanly; continuous holds full seg)
+        bool hold;
+        int seg;
     };
     std::vector<AiSeg> m_aiPlan;       // the route autoplay is following
     int m_aiPlanPos = 0;               // ticks already played of it
     int m_aiPlanTotal = 0;             // its length in ticks
-    std::vector<AiSeg> m_aiNext;       // the next route, built proactively at 60% for 75%
+    std::vector<AiSeg> m_aiNext;       // the next route, built at 80% from where this one is at 90%
     int m_aiNextTotal = 0;
     bool m_aiNextReady = false;
     bool m_aiNextTried = false;        // built (or tried) for the current route already
@@ -304,12 +226,9 @@ private:
     bool m_aiContinuous = false;       // ship / wave: the default is "keep the input"; click modes: "do nothing"
     bool m_planHold[kSlots] = {};
     int m_planSeg[kSlots] = {};
-    int m_planHoldTicks[kSlots] = {};
     int m_planLen = 0;
-    bool m_planEndedUnk = false;
     bool m_bestHold[kSlots] = {};
     int m_bestSeg[kSlots] = {};
-    int m_bestHoldTicks[kSlots] = {};
     int m_bestLen = 0;
     int m_bestReach = -1;
     int m_noclipTicks = 0;             // >0: a death was recently blocked (noclip)
@@ -385,11 +304,9 @@ public:
         for (int i = 0; i < kSlots; ++i) {
             if (!m_p[0][i]) m_ready = false;
         }
-        buildMoveTrigs(pl);
+        buildRings(pl);
         m_lastTickFrame = -1000;
         m_lastP1Frame = -1000;
-        m_tickStartX = 0.f;
-        m_prevTickDx = 0.f;
         m_dbgIn[0] = m_dbgIn[1] = 0;
         if (!cfg().autoKeep) {              // a new level: forget what was learned
             m_ai.clear();
@@ -400,213 +317,75 @@ public:
         m_aiHoldLeft = 0;
         m_aiHold = false;
         m_autoWas = false;
-        m_moves.clear();
-        m_firedMoveIDs.clear();
-        m_activeCmdGroups.clear();
-        m_groupColCache.clear();
-        m_moveTrk.clear();
-        m_fallbackMovingCount = 0;
-        if (m_moveGen.size() < kMaxFastGroup) {
-            m_moveGen.assign(kMaxFastGroup, 0);
-            m_moveCache.resize(kMaxFastGroup);
-        }
         clearOverlay();
         resetInput();
     }
 
-    // Fast filter: returns true ONLY for collidable/interactive objects that can affect ghost physics.
-    // Skips 85-95% of objects (Decorations, visual triggers, pulses, etc.) in a single jump table!
-    static bool isRelevantSimObject(GameObject* obj) {
-        if (!obj) return false;
-        if (isSpecialBlock(obj)) return true;
-        switch (obj->m_objectType) {
-            case GameObjectType::Solid:
-            case GameObjectType::Hazard:
-            case GameObjectType::AnimatedHazard:
-            case GameObjectType::CollisionObject:
-            case GameObjectType::Slope:
-            case GameObjectType::Breakable:
-            case GameObjectType::InverseGravityPortal:
-            case GameObjectType::NormalGravityPortal:
-            case GameObjectType::GravityTogglePortal:
-            case GameObjectType::YellowJumpPad:
-            case GameObjectType::PinkJumpPad:
-            case GameObjectType::GravityPad:
-            case GameObjectType::RedJumpPad:
-            case GameObjectType::SpiderPad:
-            case GameObjectType::YellowJumpRing:
-            case GameObjectType::PinkJumpRing:
-            case GameObjectType::GravityRing:
-            case GameObjectType::GreenRing:
-            case GameObjectType::DropRing:
-            case GameObjectType::RedJumpRing:
-            case GameObjectType::SpiderOrb:
-            case GameObjectType::DashRing:
-            case GameObjectType::GravityDashRing:
-            case GameObjectType::CustomRing:
-            case GameObjectType::TeleportOrb:
-            case GameObjectType::ShipPortal:
-            case GameObjectType::CubePortal:
-            case GameObjectType::BallPortal:
-            case GameObjectType::UfoPortal:
-            case GameObjectType::WavePortal:
-            case GameObjectType::RobotPortal:
-            case GameObjectType::SpiderPortal:
-            case GameObjectType::SwingPortal:
-            case GameObjectType::RegularSizePortal:
-            case GameObjectType::MiniSizePortal:
-            case GameObjectType::InverseMirrorPortal:
-            case GameObjectType::NormalMirrorPortal:
-            case GameObjectType::DualPortal:
-            case GameObjectType::SoloPortal:
-            case GameObjectType::TeleportPortal:
-                return true;
-            case GameObjectType::Modifier: {
-                int id = obj->m_objectID;
-                return id == 200 || id == 201 || id == 202 || id == 203 || id == 1334;
-            }
-            default:
-                return false;
-        }
-    }
-
     // ================================================================== orbs
-    // True only for deterministic physics jump/flip/dash orbs (excludes trigger/custom orbs,
-    // teleport orbs and teleport portals, which also inherit from RingObject!).
-    static bool isSimOrb(GameObject* obj) {
-        if (!obj) return false;
-        switch (obj->m_objectType) {
-            case GameObjectType::YellowJumpRing:
-            case GameObjectType::PinkJumpRing:
-            case GameObjectType::GravityRing:
-            case GameObjectType::GreenRing:
-            case GameObjectType::DropRing:
-            case GameObjectType::RedJumpRing:
-            case GameObjectType::SpiderOrb:
-            case GameObjectType::DashRing:
-            case GameObjectType::GravityDashRing:
-                return geode::cast::typeinfo_cast<RingObject*>(obj) != nullptr;
-            default:
-                return false;
+    // The ghost must not depend on the game handing it the orbs: every orb of the level is
+    // collected once, so a click is tested against the orbs around the ghost by geometry.
+    void buildRings(PlayLayer* pl) {
+        m_orb.rings.clear();
+        if (!pl || !pl->m_objects) return;
+        for (auto* obj : geode::cocos::CCArrayExt<GameObject*>(pl->m_objects)) {
+            if (auto ring = geode::cast::typeinfo_cast<RingObject*>(obj)) {
+                m_orb.rings.push_back({ring, ring->getPositionX()});
+            }
         }
-    }
-
-    static bool isDashOrb(GameObject* obj) {
-        return obj && (obj->m_objectType == GameObjectType::DashRing ||
-                       obj->m_objectType == GameObjectType::GravityDashRing);
+        std::sort(m_orb.rings.begin(), m_orb.rings.end(), [](RingEntry const& a, RingEntry const& b) { return a.x < b.x; });
     }
 
     // Call before every simulated run whose orb use matters; read the answer with orbUsed() right
-    // after that run.
-    void orbBegin(bool allowBuffer = false) {
-        m_orb.used = false;
-        m_orb.hitTick = -1;
-        m_orb.allowBuffer = allowBuffer;
-    }
+    // after that run. (This replaces comparing a global hit counter before / after, which also
+    // counted the runs of other candidates.)
+    void orbBegin() { m_orb.used = false; }
     bool orbUsed() const { return m_orb.used; }
-    int orbHitTick() const { return m_orb.hitTick; }
 
-    // Has this orb already been consumed for `who` (either in the real game before the search,
-    // or earlier inside the currently simulated ghost slot)? Note: GD's PlayerObject::m_touchedRings
-    // marks orbs the player merely OVERLAPPED (without clicking!), so we NEVER check m_touchedRings
-    // here — we check the real orb's activation flags and our per-slot usedRings list.
-    bool isRingConsumed(int slot, int who, RingObject* ring) const {
-        if (!ring || ring->m_isDisabled || ring->m_isDisabled2 ||
-            ring->m_isGroupDisabled || ring->m_isSpawnOnly) {
-            return true;
-        }
-        if (ring->m_isMultiActivate) return false;
-        if (who == 0 ? ring->m_activatedByPlayer1 : ring->m_activatedByPlayer2) return true;
-        int key = ring->m_uniqueID * 2 + who;
-        auto const& used = m_info[slot].usedRings;
-        return std::find(used.begin(), used.end(), key) != used.end();
-    }
+    // May the orb of this step react to the click? Only on the very tick the predicted click is
+    // pressed (holding through an orb never activates it), only for the ghost, never in a rescue.
+    bool orbAllowed(int who) const { return cfg().orbDetect && m_orb.enabled && m_stepEdge[who]; }
 
-    // May an orb activate right now for ghost `player`?
-    bool canFireOrbNow(PlayerObject* player, int who) const {
-        if (!cfg().orbDetect || !m_orb.enabled || m_orb.done[who] || !player) return false;
-        if (m_stepEdge[who]) return true;
-        return m_orb.allowBuffer && player->m_stateRingJump;
-    }
-
-    // One orb reacted (through PlayerObject::ringJump on a ghost).
+    // One orb reacted (by geometry or through the game's own playerTouchedRing).
     void orbNoteHit(int who) {
+        ++m_orb.seen;
         ++m_orb.hit;
         m_orb.done[who] = true;
-        if (!m_orb.used) m_orb.hitTick = m_info[m_curSlot].ticks;
         m_orb.used = true;
     }
 
-    // GJBaseGameLayer::canBeActivatedByPlayer hook while simulating:
-    // Allow GD's own collisionCheckObjects to test exact orb hitboxes and call playerTouchedRing
-    // for any valid, unconsumed physics orb (even on non-click ticks, so m_touchingRings stays
-    // populated for the next tick's pushButton/update just like the real game).
-    bool canSimRingTouch(PlayerObject* player, EffectGameObject* object) {
-        if (!m_simulating || !isSimPlayer(player) || !object) return false;
-        if (object->m_objectType == GameObjectType::CustomRing ||
-            object->m_objectType == GameObjectType::TeleportOrb ||
-            object->m_objectType == GameObjectType::TeleportPortal) {
-            return false;
-        }
-        if (!isSimOrb(object)) return false;
-        auto ring = static_cast<RingObject*>(object);
-        int who = player == m_stepObj[1] ? 1 : 0;
-        return !isRingConsumed(m_curSlot, who, ring);
-    }
-
-    // GJBaseGameLayer::playerTouchedRing hook while simulating
-    void simTouchedRing(PlayerObject* player, RingObject* ring) {
-        if (!m_simulating || !isSimPlayer(player) || !ring) return;
-        if (!isSimOrb(ring)) {
-            if (ring->m_objectType == GameObjectType::CustomRing ||
-                ring->m_objectType == GameObjectType::TeleportOrb ||
-                ring->m_objectType == GameObjectType::TeleportPortal) {
-                ++m_evUnknown;
-                m_hitUnknown = true;
-            }
-            return;
-        }
-        int who = player == m_stepObj[1] ? 1 : 0;
-        if (isRingConsumed(m_curSlot, who, ring)) return;
-        ++m_orb.seen;
-        if (player->m_touchingRings && !player->m_touchingRings->containsObject(ring)) {
-            player->m_touchingRings->addObject(ring);
-        }
-        if (canFireOrbNow(player, who)) {
-            // Ensure GD's ringJump sees an active ring-jump click when triggered on the click tick
-            bool prevState = player->m_stateRingJump;
-            if (m_stepEdge[who]) player->m_stateRingJump = true;
+    // Ghost, click tick: the orb that overlaps the player reacts (once per click), exactly like
+    // the game's own playerTouchedRing would, but found by geometry.
+    void simRingsByGeometry(PlayerObject* player, int who, CCRect const& pr) {
+        if (m_orb.done[who] || m_orb.rings.empty()) return;
+        float px = pr.getMidX();
+        auto it = std::lower_bound(m_orb.rings.begin(), m_orb.rings.end(), px - 90.f,
+                                   [](RingEntry const& r, float v) { return r.x < v; });
+        for (; it != m_orb.rings.end() && it->x <= px + 90.f; ++it) {
+            RingObject* ring = it->obj;
+            if (player->m_touchedRings.find(ring->m_uniqueID) != player->m_touchedRings.end()) continue;
+            CCRect rr = ring->getObjectRect();
+            float r = std::min(rr.size.width, rr.size.height) * 0.5f;
+            float cx = rr.getMidX(), cy = rr.getMidY();
+            float dx = cx - std::clamp(cx, pr.getMinX(), pr.getMaxX());
+            float dy = cy - std::clamp(cy, pr.getMinY(), pr.getMaxY());
+            if (dx * dx + dy * dy > r * r) continue;       // orbs are round
+            orbNoteHit(who);
+            player->m_touchedRings.insert(ring->m_uniqueID);   // the game's own path must not fire it again
             player->ringJump(ring, true);
-            if (!m_orb.done[who]) player->m_stateRingJump = prevState;
+            break;
         }
     }
 
-    // PlayerObject::ringJump hook guards while simulating (catches pushButton, update, AND playerTouchedRing)
-    bool beforeSimRingJump(PlayerObject* player, RingObject* ring) {
-        if (!isSimOrb(ring)) {
-            if (ring->m_objectType == GameObjectType::CustomRing ||
-                ring->m_objectType == GameObjectType::TeleportOrb ||
-                ring->m_objectType == GameObjectType::TeleportPortal) {
-                ++m_evUnknown;
-                m_hitUnknown = true;
-            }
-            return false;
-        }
-        int who = player == m_stepObj[1] ? 1 : 0;
-        if (!canFireOrbNow(player, who)) return false;
-        if (isRingConsumed(m_curSlot, who, ring)) return false;
-        return true;
-    }
-
-    void afterSimRingJump(PlayerObject* player, RingObject* ring, bool changed) {
-        if (!changed || !player || !ring) return;
-        int who = player == m_stepObj[1] ? 1 : 0;
+    // The game's own path (playerTouchedRing hook): may this orb react?
+    bool canSimRing(PlayerObject* player, EffectGameObject* object) {
+        auto ring = geode::cast::typeinfo_cast<RingObject*>(object);
+        if (!m_simulating || !isSimPlayer(player) || !ring) return false;
+        ++m_orb.seen;
+        if (player->m_touchedRings.find(ring->m_uniqueID) != player->m_touchedRings.end()) return false;
+        int who = player == m_stepObj[0] ? 0 : 1;
+        if (!orbAllowed(who)) return false;
         orbNoteHit(who);
-        if (!ring->m_isMultiActivate) {
-            int key = ring->m_uniqueID * 2 + who;
-            auto& used = m_info[m_curSlot].usedRings;
-            if (std::find(used.begin(), used.end(), key) == used.end()) used.push_back(key);
-        }
+        return true;
     }
 
     // shown on the Physics page: tells whether the ghost sees orbs at all
@@ -630,13 +409,7 @@ public:
         m_fxDraw = nullptr;
         m_fxLabels.clear();                            // owned by the layer
         m_fxPts.clear();
-        m_moveTrigs.clear();
-        m_moves.clear();
-        m_firedMoveIDs.clear();
-        m_activeCmdGroups.clear();
-        m_groupColCache.clear();
-        m_moveTrk.clear();
-        m_fallbackMovingCount = 0;
+        m_orb.rings.clear();
         m_ready = false;
         m_inUpdate = false;
         m_simulating = false;
@@ -661,19 +434,12 @@ public:
             m_pend[i].clear();
             m_supp[i] = false;
             m_game[i] = false;
-            m_owed[i] = false;
         }
-        m_moves.clear();
-        m_firedMoveIDs.clear();
-        m_activeCmdGroups.clear();
-        m_groupColCache.clear();
-        m_tickStartX = 0.f;
-        m_prevTickDx = 0.f;
         m_aiTrail.clear();
         m_aiTick = 0;
         m_aiHoldLeft = 0;
         m_aiHold = false;
-        m_aiLastForgiven = {std::numeric_limits<int64_t>::min(), false};
+        m_aiLastForgiven = {std::numeric_limits<int>::min(), false};
         clearOverlay();
         if (m_draw) m_draw->clear();
     }
@@ -682,7 +448,6 @@ public:
         clearAutoPlan();
         m_moveUntil = 0;
         m_moveTrk.clear();
-        m_fallbackMovingCount = 0;
         m_trailHold.clear();
         m_trailRelease.clear();
         m_pathPts.clear();
@@ -747,46 +512,22 @@ public:
         applyGravityPortal(pl, player, object->m_objectType);
     }
 
-    // The collision hook hands us the objects near a ghost player. Portals & special blocks
-    // (D/J/S/H) the game would apply with side effects (or not at all) are applied here, by
+    // The collision hook hands us the objects near a ghost player. Portals the
+    // game would apply with side effects (or not at all) are applied here, by
     // geometry, with no visuals and without touching any real object state.
-    void simTouchObjects(PlayerObject* player, GdVec<GameObject*>* vec, int count) {
+    void simTouchObjects(PlayerObject* player, std::vector<GameObject*>* vec, int count) {
         PlayLayer* pl = PlayLayer::get();
         if (!m_simulating || !pl || !isSimPlayer(player) || !vec) return;
         int who = player == m_stepObj[1] ? 1 : 0;
         CCRect pr = player->getObjectRect();
+        if (orbAllowed(who)) simRingsByGeometry(player, who, pr);
         for (int i = 0; i < count; ++i) {
             GameObject* obj = vec->at(i);
-            if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
-            // Special blocks: D (1755), J (1813), S (1829), H (1859)
-            if (isSpecialBlock(obj)) {
-                if (cfg().dBlock) {
-                    if (obj->getObjectRect().intersectsRect(pr)) {
-                        int id = obj->m_objectID;
-                        if (id == kDBlockId) player->m_stateDartSlide = 2;
-                        else if (id == kJBlockId) player->m_stateNoAutoJump = 2;
-                        else if (id == kSBlockId) {
-                            if (player->m_isDashing) {
-                                player->stopDashing();
-                                player->m_jumpBuffered = false;
-                            }
-                        } else if (id == kHBlockId) player->m_stateHitHead = 2;
-                    }
-                    continue;
-                }
-            }
+            if (!obj) continue;
             TouchKind kind = classify(obj);
             if (kind == TouchKind::None) continue;
             CCRect orect = obj->getObjectRect();
             if (!orect.intersectsRect(pr)) continue;
-            EffectGameObject* eff = geode::cast::typeinfo_cast<EffectGameObject*>(obj);
-            if (eff) {
-                if ((kind == TouchKind::Gravity || kind == TouchKind::Speed || kind == TouchKind::Pad) &&
-                    !eff->m_isMultiActivate &&
-                    (who == 0 ? eff->m_activatedByPlayer1 : eff->m_activatedByPlayer2)) {
-                    continue;
-                }
-            }
             if (markTouched(obj, who)) continue;
             if (kind == TouchKind::Gravity) {
                 ++m_evGrav;
@@ -794,15 +535,6 @@ public:
             } else if (kind == TouchKind::Speed) {
                 ++m_evSpeed;
                 player->updateTimeMod(speedOf(obj->m_objectID), true);
-            } else if (kind == TouchKind::Pad) {
-                applyPad(pl, player, obj, eff);
-            } else if (kind == TouchKind::Size) {
-                player->togglePlayerScale(obj->m_objectType == GameObjectType::MiniSizePortal, true);
-                player->setVisible(false);
-                player->m_isObjectRectDirty = true;
-                player->m_isOrientedBoxDirty = true;
-            } else if (kind == TouchKind::Mode) {
-                applyModePortal(player, obj->m_objectType);
             } else {
                 ++m_evUnknown;
                 m_hitUnknown = true;
@@ -812,20 +544,14 @@ public:
 
     // ------------------------------------------------- who really gets the input
     // handleButton hook: around the original call, PlayerObject::pushButton /
-    // releaseButton tell which player the game gave the input to, AND keep m_game[]
-    // permanently synchronized with GD's real player hold state.
+    // releaseButton tell which player the game gave the input to.
     void beginHandle() {
         m_inHandle = true;
         m_recvP = nullptr;
         m_recvCount = 0;
     }
-    void noteRealButton(PlayerObject* p, bool down) {
-        if (m_simulating || !p) return;
-        if (PlayLayer* pl = PlayLayer::get()) {
-            if (p == pl->m_player1) m_game[0] = down;
-            else if (p == pl->m_player2) m_game[1] = down;
-        }
-        if (!m_inHandle) return;
+    void noteReceiver(PlayerObject* p) {
+        if (!m_inHandle || m_simulating || !p) return;
         if (m_recvCount == 0) {
             m_recvP = p;
             m_recvCount = 1;
@@ -913,108 +639,14 @@ public:
     void endLate() { finishLate(); }
     void setInUpdate(bool v) { m_inUpdate = v; }
 
-    // ---------------------------------------------------------- move trigger model
-    // Collect all x-activated Move triggers (object ID 901) once when the level loads.
-    void buildMoveTrigs(PlayLayer* pl) {
-        m_moveTrigs.clear();
-        if (!pl || !pl->m_objects) return;
-        for (auto* obj : geode::cocos::CCArrayExt<GameObject*>(pl->m_objects)) {
-            if (!obj || obj->m_objectID != 901) continue;
-            auto eff = geode::cast::typeinfo_cast<EffectGameObject*>(obj);
-            if (!eff) continue;
-            if (eff->m_isSpawnTriggered || eff->m_isTouchTriggered) continue;
-            if (eff->m_isDisabled || eff->m_isDisabled2) continue;
-            if (eff->m_targetGroupID <= 0) continue;
-            m_moveTrigs.push_back({eff, eff->getPositionX(), eff->m_uniqueID});
-        }
-        std::sort(m_moveTrigs.begin(), m_moveTrigs.end(),
-                  [](MoveTrig const& a, MoveTrig const& b) { return a.x < b.x; });
-    }
-
-    static double evalEase(double u, int easingType, float easingRate) {
-        if (u <= 0.0) return 0.0;
-        if (u >= 1.0) return 1.0;
-        if (easingType == 0) return u;
-        float rate = easingRate > 0.f ? easingRate : 2.f;
-        return static_cast<double>(GameToolbox::getEasedValue(static_cast<float>(u), easingType, rate));
-    }
-
-    // Real game: GJEffectManager::createMoveCommand gives us the EXACT resolved world-unit offset,
-    // remapped groupID, duration (seconds), easing, and player/camera locks for EVERY move trigger
-    // (x-triggered, touch-triggered, spawn-triggered, move-to-target, etc.).
-    void onCreateMoveCommand(
-        GJEffectManager* mgr, CCPoint pt, int groupID, float duration,
-        int easingType, float easingRate,
-        bool lockPlayerX, bool lockPlayerY,
-        bool lockCameraX, bool lockCameraY,
-        float moveModX, float moveModY,
-        int /*uniqueID*/, int controlID
-    ) {
-        PlayLayer* pl = PlayLayer::get();
-        if (!cfg().moveDetect || !pl || mgr != pl->m_effectManager || groupID <= 0) return;
-
-        // Prune finished commands so m_moves stays tiny
-        double now = m_secClock;
-        m_moves.erase(std::remove_if(m_moves.begin(), m_moves.end(), [&](MoveCmd const& c) {
-            return now > c.start + c.len + 0.15;
-        }), m_moves.end());
-
-        bool hasLock = lockPlayerX || lockPlayerY || lockCameraX || lockCameraY;
-        if (duration <= 1e-5f && !hasLock) return;  // instant move: already applied on next tick
-
-        MoveCmd cmd;
-        cmd.group = groupID;
-        cmd.controlID = controlID;
-        cmd.amp = pt;
-        cmd.start = now;
-        cmd.len = std::max(0.0, static_cast<double>(duration));
-        cmd.easing = easingType;
-        cmd.rate = easingRate > 0.f ? easingRate : 2.f;
-        cmd.lockX = lockPlayerX;
-        cmd.lockY = lockPlayerY;
-        cmd.modX = moveModX != 0.f ? moveModX : 1.f;
-        cmd.modY = moveModY != 0.f ? moveModY : 1.f;
-        cmd.unsupported = lockCameraX || lockCameraY;
-        if (m_moves.size() >= 256) m_moves.erase(m_moves.begin());
-        m_moves.push_back(cmd);
-        m_activeCmdGroups.insert(groupID);
-    }
-
-    void pruneMoves() {
-        if (m_moves.empty()) {
-            m_activeCmdGroups.clear();
-            return;
-        }
-        double now = m_secClock;
-        size_t before = m_moves.size();
-        m_moves.erase(std::remove_if(m_moves.begin(), m_moves.end(), [&](MoveCmd const& c) {
-            return now > c.start + c.len + 0.15;
-        }), m_moves.end());
-        if (m_moves.size() != before) {
-            m_activeCmdGroups.clear();
-            for (auto const& c : m_moves) m_activeCmdGroups.insert(c.group);
-        }
-    }
-
-    // Real game: an x/touch/spawn move trigger fired. Remember its uniqueID so the upcoming
-    // x-trigger scanner never double-starts it (its actual command is captured by onCreateMoveCommand).
-    void onRealMoveTrigger(EffectGameObject* obj) {
-        if (!cfg().moveDetect || !obj) return;
-        m_firedMoveIDs.insert(obj->m_uniqueID);
+    // Real game: a move trigger just fired. For its duration the objects it moves are
+    // not where the ghost sees them, so the prediction must not be trusted near them.
+    void onRealMoveTrigger(float duration) {
+        if (!cfg().moveDetect) return;
         float tps = effectiveTps();
         if (tps <= 0.f) tps = 240.f;
-        long ticks = static_cast<long>(std::ceil(std::max(0.f, obj->m_duration) * tps)) + 4;
+        long ticks = static_cast<long>(std::ceil(std::max(0.f, duration) * tps)) + 4;
         m_moveUntil = std::max(m_moveUntil, m_now + ticks);
-    }
-
-    // Real game: Stop / Pause / Resume trigger (1616) fired. Mark matching active moves unsupported
-    // so we do not keep extrapolating a stopped move.
-    void onRealStopTrigger(EffectGameObject* obj) {
-        if (!cfg().moveDetect || !obj || obj->m_targetGroupID <= 0) return;
-        int tid = obj->m_targetGroupID;
-        for (auto& cmd : m_moves) {
-            if (cmd.controlID == tid || cmd.group == tid) cmd.unsupported = true;
-        }
     }
 
     bool moveActive() const { return cfg().moveDetect && m_now < m_moveUntil; }
@@ -1022,293 +654,25 @@ public:
     // Ghost: an object that may be moving and cannot be predicted: stop trusting the sim
     void flagMovingObject() { m_hitUnknown = true; }
 
-    // Ghost: when the ghost crosses an upcoming x-activated Move trigger between prevX and newX,
-    // start a SimMove in slot `s` using the trigger's exact group ID, offset, duration and easing.
-    void triggerSimMoves(PlayLayer* pl, int s, float prevX, float newX, float newY) {
-        if (!cfg().moveDetect || m_moveTrigs.empty() || !pl) return;
-        float lo = std::min(prevX, newX);
-        float hi = std::max(prevX, newX);
-        if (hi - lo < 1e-4f) return;
-        auto it = std::lower_bound(m_moveTrigs.begin(), m_moveTrigs.end(), lo,
-                                   [](MoveTrig const& t, float x) { return t.x < x; });
-        auto& inf = m_info[s];
-        for (; it != m_moveTrigs.end() && it->x <= hi; ++it) {
-            if (prevX <= newX && it->x <= prevX) continue;
-            if (prevX > newX && it->x >= prevX) continue;
-            if (m_firedMoveIDs.count(it->uniqueID)) continue;
-            if (std::find(inf.simTrigIDs.begin(), inf.simTrigIDs.end(), it->uniqueID) != inf.simTrigIDs.end()) continue;
-            EffectGameObject* eff = it->obj;
-            if (!eff || eff->m_isDisabled || eff->m_isDisabled2 || eff->m_isGroupDisabled) continue;
-            if (eff->m_targetGroupID <= 0) continue;
-
-            inf.simTrigIDs.push_back(it->uniqueID);
-            SimMove sm;
-            sm.group = eff->m_targetGroupID;
-            sm.start = inf.simTime;
-            sm.len = std::max(0.0, static_cast<double>(eff->m_duration));
-            sm.easing = static_cast<int>(eff->m_easingType);
-            sm.rate = eff->m_easingRate > 0.f ? eff->m_easingRate : 2.f;
-            sm.lockX = eff->m_lockToPlayerX;
-            sm.lockY = eff->m_lockToPlayerY;
-            sm.modX = eff->m_moveModX != 0.f ? eff->m_moveModX : 1.f;
-            sm.modY = eff->m_moveModY != 0.f ? eff->m_moveModY : 1.f;
-            sm.startP1X = newX;
-            sm.startP1Y = newY;
-            sm.unsupported = eff->m_lockToCameraX || eff->m_lockToCameraY || eff->m_isDynamicMode;
-            if (!sm.unsupported) {
-                if (!eff->m_useMoveTarget) {
-                    sm.amp = eff->m_moveOffset;
-                } else {
-                    auto singlePos = [&](int gid, CCPoint& out) -> bool {
-                        if (gid <= 0) return false;
-                        CCArray* arr = pl->getGroup(gid);
-                        if (!arr || arr->count() == 0) return false;
-                        auto* o = static_cast<GameObject*>(arr->objectAtIndex(0));
-                        if (!o) return false;
-                        out = o->getPosition();
-                        CCPoint prevOff(0.f, 0.f);
-                        if (groupOffsetAt(s, gid, inf.simTime, newX, newY, prevOff) == 1) {
-                            out = out + prevOff;
-                        }
-                        return true;
-                    };
-                    int srcGid = eff->m_targetModCenterID > 0 ? eff->m_targetModCenterID : eff->m_targetGroupID;
-                    CCPoint srcPos, dstPos;
-                    bool hasSrc = singlePos(srcGid, srcPos);
-                    bool hasDst = false;
-                    if (eff->m_targetPlayer1 || eff->m_targetPlayer2) {
-                        dstPos = ccp(newX, newY);
-                        hasDst = true;
-                    } else {
-                        hasDst = singlePos(eff->m_centerGroupID, dstPos);
-                    }
-                    if (hasSrc && hasDst) {
-                        CCPoint delta = dstPos - srcPos;
-                        if (eff->m_moveTargetMode == MoveTargetType::XOnly) delta.y = 0.f;
-                        else if (eff->m_moveTargetMode == MoveTargetType::YOnly) delta.x = 0.f;
-                        sm.amp = delta;
-                    } else {
-                        sm.unsupported = true;
-                    }
-                }
-            }
-            inf.simMoves.push_back(sm);
-        }
-    }
-
-    // Compute the predicted offset of a single group `g` at simulated time `simSec` (relative to t_now),
-    // with ghost player 1 at `(gx, gy)`. Returns: 0 = no move affects this group, 1 = predicted, -1 = unsupported.
-    int groupOffsetAt(int s, int g, double simSec, float gx, float gy, CCPoint& acc) const {
-        int status = 0;
-        double now = m_secClock;
-        double tTarget = now + simSec;
-
-        for (auto const& cmd : m_moves) {
-            if (cmd.group != g) continue;
-            double endT = cmd.start + cmd.len;
-            if (now >= endT) continue;                // already finished before search started
-            if (cmd.unsupported) return -1;
-            status = 1;
-            double eNow = cmd.len <= 1e-6 ? 1.0 : evalEase((now - cmd.start) / cmd.len, cmd.easing, cmd.rate);
-            double eTar = cmd.len <= 1e-6 ? 1.0 : evalEase((tTarget - cmd.start) / cmd.len, cmd.easing, cmd.rate);
-            double de = eTar - eNow;
-            if (!cmd.lockX) acc.x += static_cast<float>(cmd.amp.x * de);
-            else if (simSec > 1e-6) {
-                double frac = std::min(1.0, (endT - now) / simSec);
-                acc.x += static_cast<float>((gx - m_realP1X) * cmd.modX * frac);
-            }
-            if (!cmd.lockY) acc.y += static_cast<float>(cmd.amp.y * de);
-            else if (simSec > 1e-6) {
-                double frac = std::min(1.0, (endT - now) / simSec);
-                acc.y += static_cast<float>((gy - m_realP1Y) * cmd.modY * frac);
-            }
-        }
-
-        for (auto const& sm : m_info[s].simMoves) {
-            if (sm.group != g) continue;
-            if (simSec < sm.start) continue;          // not triggered yet at this time
-            if (sm.unsupported) return -1;
-            status = 1;
-            double eTar = sm.len <= 1e-6 ? 1.0 : evalEase((simSec - sm.start) / sm.len, sm.easing, sm.rate);
-            if (!sm.lockX) acc.x += static_cast<float>(sm.amp.x * eTar);
-            else {
-                double span = simSec - sm.start;
-                double frac = (span > 1e-6 && sm.len > 1e-6) ? std::min(1.0, sm.len / span) : 1.0;
-                acc.x += static_cast<float>((gx - sm.startP1X) * sm.modX * frac);
-            }
-            if (!sm.lockY) acc.y += static_cast<float>(sm.amp.y * eTar);
-            else {
-                double span = simSec - sm.start;
-                double frac = (span > 1e-6 && sm.len > 1e-6) ? std::min(1.0, sm.len / span) : 1.0;
-                acc.y += static_cast<float>((gy - sm.startP1Y) * sm.modY * frac);
-            }
-        }
-        return status;
-    }
-
-    void beginSimCollision(PlayerObject* player) {
-        if (!player) return;
-        PlayerObject* p1 = m_p[0][m_curSlot];
-        if (p1) {
-            m_ghostPlayerX = p1->getPositionX();
-            m_ghostPlayerY = p1->getPositionY();
-            m_prevGhostPlayerX = p1->m_lastPosition.x;
-            m_prevGhostPlayerY = p1->m_lastPosition.y;
-        } else {
-            m_ghostPlayerX = player->getPositionX();
-            m_ghostPlayerY = player->getPositionY();
-            m_prevGhostPlayerX = player->m_lastPosition.x;
-            m_prevGhostPlayerY = player->m_lastPosition.y;
-        }
-
-        // Precompute exact eased offsets ONCE per ghost tick for every active / simulated
-        // moving group into an O(1) generation-stamped table. Zero per-object trigger scans!
-        m_tickHasMove = false;
-        m_tickHorizGroups.clear();
-        auto const& inf = m_info[m_curSlot];
-        if (!cfg().moveDetect || (m_moves.empty() && inf.simMoves.empty())) return;
-
-        if (++m_curMoveGen == 0) {
-            std::fill(m_moveGen.begin(), m_moveGen.end(), 0);
-            m_curMoveGen = 1;
-        }
-        m_moveCacheHi.clear();
-        if (m_moveGen.size() < kMaxFastGroup) {
-            m_moveGen.assign(kMaxFastGroup, 0);
-            m_moveCache.resize(kMaxFastGroup);
-        }
-
-        double now = m_secClock;
-        auto cacheGroup = [&](int g) {
-            if (g <= 0) return;
-            if (g < kMaxFastGroup) {
-                if (m_moveGen[g] == m_curMoveGen) return;
-                MoveCacheEntry e;
-                int st = groupOffsetAt(m_curSlot, g, inf.simTime, m_ghostPlayerX, m_ghostPlayerY, e.off);
-                if (st < 0) {
-                    e.unsupported = true;
-                } else if (st == 0) {
-                    return;
-                } else {
-                    groupOffsetAt(m_curSlot, g, inf.prevSimTime, m_prevGhostPlayerX, m_prevGhostPlayerY, e.prevOff);
-                    if (std::fabs(e.off.x) > 15.f) m_tickHorizGroups.push_back(g);
-                }
-                m_moveGen[g] = m_curMoveGen;
-                m_moveCache[g] = e;
-                m_tickHasMove = true;
-            } else {
-                if (m_moveCacheHi.find(g) != m_moveCacheHi.end()) return;
-                MoveCacheEntry e;
-                int st = groupOffsetAt(m_curSlot, g, inf.simTime, m_ghostPlayerX, m_ghostPlayerY, e.off);
-                if (st < 0) {
-                    e.unsupported = true;
-                } else if (st == 0) {
-                    return;
-                } else {
-                    groupOffsetAt(m_curSlot, g, inf.prevSimTime, m_prevGhostPlayerX, m_prevGhostPlayerY, e.prevOff);
-                    if (std::fabs(e.off.x) > 15.f) m_tickHorizGroups.push_back(g);
-                }
-                m_moveCacheHi.emplace(g, e);
-                m_tickHasMove = true;
-            }
-        };
-
-        for (auto const& c : m_moves) {
-            if (now < c.start + c.len) cacheGroup(c.group);
-        }
-        for (auto const& sm : inf.simMoves) {
-            if (inf.simTime >= sm.start) cacheGroup(sm.group);
-        }
-    }
-
-    // If an active or simulated move trigger slides a group horizontally into the ghost's current
-    // collision section from another X section, pull ONLY the nearby collidable objects into `cand`
-    // using a per-search sorted collidable-only group cache (O(log K), skips all Decoration objects!).
-    void appendMovingGroupObjects(GJBaseGameLayer* layer, PlayerObject* player, GdVec<GameObject*>& cand) {
-        if (!m_tickHasMove || m_tickHorizGroups.empty() || !layer || !player) return;
-
-        float px = player->getPositionX();
-        for (int g : m_tickHorizGroups) {
-            MoveCacheEntry const* ent = nullptr;
-            if (g < kMaxFastGroup && m_moveGen[g] == m_curMoveGen) ent = &m_moveCache[g];
-            else {
-                auto hi = m_moveCacheHi.find(g);
-                if (hi != m_moveCacheHi.end()) ent = &hi->second;
-            }
-            if (!ent || ent->unsupported) continue;
-
-            auto cacheIt = m_groupColCache.find(g);
-            if (cacheIt == m_groupColCache.end()) {
-                std::vector<GroupObj> list;
-                if (CCArray* arr = layer->getGroup(g)) {
-                    unsigned int cnt = arr->count();
-                    if (cnt > 0) {
-                        list.reserve(std::min<unsigned int>(cnt, 64));
-                        for (auto* obj : geode::cocos::CCArrayExt<GameObject*>(arr)) {
-                            if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
-                            if (!isRelevantSimObject(obj)) continue;
-                            list.push_back({obj, obj->getPositionX()});
-                        }
-                        std::sort(list.begin(), list.end(),
-                                  [](GroupObj const& a, GroupObj const& b) { return a.baseX < b.baseX; });
-                    }
-                }
-                cacheIt = m_groupColCache.emplace(g, std::move(list)).first;
-            }
-            auto const& objs = cacheIt->second;
-            if (objs.empty()) continue;
-
-            float loX = px - ent->off.x - 120.f;
-            float hiX = px - ent->off.x + 120.f;
-            auto it = std::lower_bound(objs.begin(), objs.end(), loX,
-                                       [](GroupObj const& a, float x) { return a.baseX < x; });
-            for (; it != objs.end() && it->baseX <= hiX; ++it) {
-                GameObject* obj = it->obj;
-                if (std::find(cand.begin(), cand.end(), obj) == cand.end()) {
-                    cand.push_back(obj);
-                }
-            }
-        }
-    }
-
-    // Moving objects fallback clock: tracks both 60fps-normalized game time (m_clock) and exact
-    // seconds (m_secClock, already timeWarp-scaled) for move triggers.
+    // Moving objects. Their speed is MEASURED in the real game against game time (the sum
+    // of the dt of the physics steps), not against frames or ticks, so Click Between
+    // Frames (extra sub-steps with odd dt, objects only move once per frame) cannot skew it.
+    // The ghost then shifts those objects along their measured speed for each simulated tick.
     void addClock(PlayerObject* p, float dt) {
         PlayLayer* pl = PlayLayer::get();
-        if (pl && p == pl->m_player1 && dt > 0.f && dt < 5.f) {
-            m_clock += dt;
-            m_secClock += static_cast<double>(dt) / 60.0;
-        }
+        if (pl && p == pl->m_player1 && dt > 0.f && dt < 5.f) m_clock += dt;
     }
 
     float moveFresh() const { return 40.f * std::max(1e-4f, stepDt()); }
 
-    // real game, every collision pass of player 1 (fallback for Follow / AreaMove / Practice checkpoints)
-    // Only tracks collidable/interactive objects that are NOT already driven by an active Move Trigger.
-    void observeObjects(GdVec<GameObject*>* vec, int count) {
+    // real game, every collision pass of player 1
+    void observeObjects(std::vector<GameObject*>* vec, int count) {
         if (!cfg().moveDetect || !vec) return;
-        if (m_moveTrk.size() > 2048) {
-            m_moveTrk.clear();
-            m_fallbackMovingCount = 0;
-        }
+        if (m_moveTrk.size() > 4000) m_moveTrk.clear();
         double fresh = moveFresh();
-        bool hasActiveCmds = !m_activeCmdGroups.empty();
         for (int i = 0; i < count; ++i) {
             GameObject* o = vec->at(i);
-            if (!o || !o->m_groups || o->m_groupCount <= 0 || o->m_groups->at(0) == 0) continue;
-            if (!isRelevantSimObject(o)) continue;
-            if (hasActiveCmds) {
-                bool covered = false;
-                int ng = std::min<int>(o->m_groupCount, 10);
-                for (int k = 0; k < ng; ++k) {
-                    int g = o->m_groups->at(k);
-                    if (g > 0 && m_activeCmdGroups.count(g)) {
-                        covered = true;
-                        break;
-                    }
-                }
-                if (covered) continue;
-            }
+            if (!o || !o->m_groups || o->m_groups->at(0) == 0) continue;     // not movable
             auto& t = m_moveTrk[o->m_uniqueID];
             CCPoint p = o->getPosition();
             if (!t.seen) {
@@ -1325,70 +689,27 @@ public:
                 } else {
                     t.hasVel = false;
                 }
-                if (!t.moving) {
-                    t.moving = true;
-                    ++m_fallbackMovingCount;
-                }
+                t.moving = true;
                 t.last = p;
                 t.changeClock = m_clock;
             } else if (t.moving && m_clock - t.changeClock > fresh) {
                 t.moving = false;
                 t.hasVel = false;
-                if (m_fallbackMovingCount > 0) --m_fallbackMovingCount;
             }
         }
     }
 
     enum class MoveState { Static, Predicted, Unknown };
 
-    bool hasAnySimMove() const {
-        return cfg().moveDetect && (m_tickHasMove || m_fallbackMovingCount > 0);
-    }
-
-    // ghost: O(1) lookup from the per-tick precomputed move cache (zero trigger scans per object!).
-    // Falls back to m_moveTrk ONLY when no Move Trigger matched AND m_fallbackMovingCount > 0.
-    MoveState simMove(GameObject* o, CCPoint& offset, CCPoint& prevOffset) {
-        offset = CCPoint(0.f, 0.f);
-        prevOffset = CCPoint(0.f, 0.f);
-        if (!cfg().moveDetect || (!m_tickHasMove && m_fallbackMovingCount == 0) ||
-            !o || !o->m_groups || o->m_groupCount <= 0) {
-            return MoveState::Static;
-        }
-
-        bool matchedTrigger = false;
-        if (m_tickHasMove) {
-            int nGroups = std::min<int>(o->m_groupCount, 10);
-            for (int i = 0; i < nGroups; ++i) {
-                int g = o->m_groups->at(i);
-                if (g <= 0) continue;
-                MoveCacheEntry const* ent = nullptr;
-                if (g < kMaxFastGroup) {
-                    if (m_moveGen[g] == m_curMoveGen) ent = &m_moveCache[g];
-                } else if (!m_moveCacheHi.empty()) {
-                    auto hi = m_moveCacheHi.find(g);
-                    if (hi != m_moveCacheHi.end()) ent = &hi->second;
-                }
-                if (!ent) continue;
-                if (ent->unsupported) return MoveState::Unknown;
-                matchedTrigger = true;
-                offset = offset + ent->off;
-                prevOffset = prevOffset + ent->prevOff;
-            }
-        }
-        if (matchedTrigger) return MoveState::Predicted;
-
-        // Fallback: no Move Trigger targets any of this object's groups.
-        if (m_fallbackMovingCount <= 0) return MoveState::Static;
+    // ghost: where is this object during the tick that is being simulated?
+    MoveState simMove(GameObject* o, CCPoint& offset) {
         auto it = m_moveTrk.find(o->m_uniqueID);
-        if (it == m_moveTrk.end()) return MoveState::Static;
+        if (it == m_moveTrk.end()) return moveActive() ? MoveState::Unknown : MoveState::Static;
         auto& t = it->second;
         if (!t.moving || m_clock - t.changeClock > moveFresh()) return MoveState::Static;
         if (!t.hasVel) return MoveState::Unknown;
-        auto const& inf = m_info[m_curSlot];
-        float elCur = static_cast<float>(inf.simTime * 60.0);
-        float elPrev = static_cast<float>(inf.prevSimTime * 60.0);
-        offset = t.vel * elCur;
-        prevOffset = t.vel * elPrev;
+        float elapsed = static_cast<float>(m_info[m_curSlot].ticks + 1) * m_stepDtNow;
+        offset = t.vel * elapsed;
         return MoveState::Predicted;
     }
 
@@ -1480,21 +801,20 @@ public:
             }
             return cfg().bothSides ? (m_raw[0] || m_raw[1]) : m_raw[1];
         }
-        if (m_layout == Layout::DualSolo) {
-            return m_raw[0] || m_raw[1];
-        }
         if (m_layout == Layout::TwoPlayer) {
             for (int sd = 0; sd < 2; ++sd) {
                 if (sideOwner(sd == 1) == pi) return m_raw[sd];
             }
         }
-        known = false;
-        return false;
+        known = false;                                  // dual in a 1-player level: not sure how
+        return false;                                   // the game spreads a tap, so no guessing
     }
 
-    // Safety net for the input bookkeeping (ONLY runs while the mod is enabled). It only ever
-    // RELEASES (never synthesizes a press): if the game is held, nothing is queued, and no finger
-    // is down for 3 ticks, release it.
+    // Safety net for the input bookkeeping. It only ever RELEASES (a press made up from stale
+    // state would be worse than the bug): if the game was told "hold", nothing is being held
+    // back, and no finger is on that player's side for 3 ticks, the hold is stuck: release it.
+    // After coming back to solo (dual ended) the game gets one release regardless of what the
+    // mod believes, because the game itself may have kept the hold.
     void reconcile(PlayLayer* pl, int n) {
         for (int pi = 0; pi < n; ++pi) {
             PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
@@ -1513,9 +833,7 @@ public:
             PlayerObject* p1 = pl->m_player1;
             bool known = false;
             bool down = fingerOn(pl, 0, known);
-            if (p1 && !p1->m_isDead && m_pend[0].empty() && m_game[0] && known && !down) {
-                fire(pl, 0, false);
-            }
+            if (p1 && !p1->m_isDead && m_pend[0].empty() && known && !down) fire(pl, 0, false);
         }
     }
 
@@ -1533,9 +851,9 @@ public:
     }
 
     // ================================================================ input
-    // Returns false when the event was swallowed (held back / dropped / autoplay).
-    // When the mod is disabled (and autoplay is off), this is a 100% pure passthrough:
-    // never rewrites isP1, never swallows any press or release.
+    // isP1 may be rewritten: in solo both screen sides are player 1.
+    // Returns false when the event was swallowed (it may still have been
+    // delivered through fire(), see below).
     bool onInput(GJBaseGameLayer* layer, bool push, bool& isP1) {
         PlayLayer* pl = PlayLayer::get();
         if (!pl) return true;
@@ -1556,26 +874,8 @@ public:
             }
         }
 
-        // Mod disabled: pure passthrough (never swallow, never remap isP1, never get holds stuck)
-        if (!c.enabled) {
-            for (int i = 0; i < 2; ++i) {
-                m_pend[i].clear();
-                m_supp[i] = false;
-                m_owed[i] = false;
-                m_stuck[i] = 0;
-            }
-            m_sweep = 0;
-            if (lay == Layout::TwoPlayer) {
-                int who = sideOwner(origP1);
-                if (who == 0 || who == 1) m_phys[who] = push;
-            } else {
-                m_phys[0] = m_raw[0] || m_raw[1];
-            }
-            return true;
-        }
-
-        // "both sides = player 1" only outside 2-player levels: there the game already
-        // routes left / right to its own players.
+        // "both sides = player 1" only in solo outside 2-player levels: there the
+        // game already routes left / right to its own players
         bool twoLvl = twoFlagOf(pl);
         bool remap = lay == Layout::Solo && c.bothSides && !twoLvl;
         if (lay == Layout::Solo && twoLvl) {
@@ -1592,18 +892,12 @@ public:
         } else if (lay == Layout::Solo && !remap && !origP1) {
             m_phys[1] = push;                          // not ours to handle, but the finger is real
             return true;
-        } else if (lay == Layout::DualSolo && !c.dualSupport) {
-            // 1-player dual with dualSupport disabled: pure passthrough
-            m_pend[0].clear();
-            m_supp[0] = false;
-            m_owed[0] = false;
-            m_phys[0] = m_raw[0] || m_raw[1];
-            return true;
         }
-
-        // Solo and 1-player Dual: ONE unified input buffer (pi = 0) drives the game.
-        // Only true 2-player mode splits left / right into P1 (0) and P2 (1).
-        int pi = 0;
+        // Solo: one player. Dual / 2-player: every event belongs to the player it
+        // came from, and every player is its own buffer (own mode, own delay).
+        int pi = (lay != Layout::Solo && !origP1) ? 1 : 0;
+        // 2-player mode: the game decides which side drives which player (flip 2-player
+        // controls). Never guessed: the real input shows it, and one known side gives the other.
         if (lay == Layout::TwoPlayer) {
             int who = sideOwner(origP1);
             if (who < 0) {
@@ -1618,28 +912,26 @@ public:
         ++m_dbgIn[pi];
         m_dbgFlag = origP1 ? 1 : 0;
         m_dbgPi = pi;
-        m_phys[pi] = (lay == Layout::DualSolo || remap) ? (m_raw[0] || m_raw[1]) : push;
+        m_phys[pi] = push;
         PlayerObject* po = pi == 0 ? layer->m_player1 : layer->m_player2;
 
         // fail-open: if the physics tick hook is not running, do not touch anything
         int frames = static_cast<int>(CCDirector::sharedDirector()->getTotalFrames());
         bool tickAlive = frames - m_lastTickFrame <= c.failOpen;
 
-        bool modeActive = po && !po->m_isDead && c.maxDelay[detectMode(po)] > 0;
-        if (lay == Layout::DualSolo && layer->m_player1 && layer->m_player2) {
-            modeActive = !layer->m_player1->m_isDead && !layer->m_player2->m_isDead &&
-                         (c.maxDelay[detectMode(layer->m_player1)] > 0 ||
-                          c.maxDelay[detectMode(layer->m_player2)] > 0);
-        }
-        bool active = c.enabled && m_ready && tickAlive && modeActive &&
+        bool active = c.enabled && m_ready && tickAlive && po && !po->m_isDead &&
+                      c.maxDelay[detectMode(po)] > 0 &&
                       !(lay == Layout::TwoPlayer && !c.twoPlayerMode) &&
                       !(lay == Layout::DualSolo && !c.dualSupport);
         if (!active) {
             m_pend[pi].clear();
             m_supp[pi] = false;
-            m_owed[pi] = false;
-            // Never drop a release (!push); only deduplicate an identical duplicate press if remapped
-            if (remap && !origP1 && push && m_game[pi]) return false;
+            if (remap) {
+                isP1 = true;                         // both screen sides are player 1
+                // some builds send the same press as a "player 2" copy: drop duplicates
+                if (!origP1 && push == m_game[pi]) return false;
+            }
+            m_game[pi] = push;
             return true;
         }
         return rescue(pl, pi, push, po);
@@ -1654,7 +946,6 @@ private:
         auto& pend = m_pend[pi];
         if (!push && m_supp[pi]) {                  // release of a click that was dropped
             m_supp[pi] = false;
-            if (pend.empty()) m_owed[pi] = false;
             return false;
         }
 
@@ -1662,12 +953,6 @@ private:
         // that is running (that tick has already been counted).
         long a = m_now + (m_inUpdate ? 0 : 1);
         if (!pend.empty()) {
-            // In continuous modes (Ship / Wave), cap runaway queue buildup during rapid spam
-            // so a single early delay doesn't lock out rescue decisions for the whole spam section.
-            if (isContinuous(detectMode(po)) && pend.size() >= 2) {
-                if (pend.back().push == push) return false;
-                pend.back().tick = std::min(pend.back().tick, a + 1);
-            }
             // an earlier event is still being held back: stay behind it and keep
             // the spacing you had (no new search, nothing is "re-decided")
             long fireAt = pend.back().tick + std::max<long>(1, a - m_arr[pi]);
@@ -1678,28 +963,12 @@ private:
         }
         if (push == m_game[pi]) return true;        // nothing changes for the game
 
-        bool dual = (m_layout == Layout::DualSolo && pl->m_player1 && pl->m_player2);
         Mode mode = detectMode(po);
-        Mode mode2 = dual ? detectMode(pl->m_player2) : mode;
-        bool cont0 = isContinuous(mode) || po->m_isDashing;
-        bool cont1 = dual ? (isContinuous(mode2) || pl->m_player2->m_isDashing) : cont0;
-
+        m_otherOverride = (m_layout == Layout::DualSolo) ? (push ? 1 : 0) : -1;
         Decision d;
-        if (!push) {
-            // Release: ship / wave / active dash orb (or either player in 1-player dual)
-            if (cont0 || cont1) {
-                Mode hm = isContinuous(mode) ? mode : (isContinuous(mode2) ? mode2 : M_SHIP);
-                d = decideHold(pl, hm, pi, false);
-            }
-        } else {
-            // Press: if both players (or the solo player) are continuous -> hold search; else click search
-            if (cont0 && cont1) {
-                Mode hm = isContinuous(mode) ? mode : mode2;
-                d = decideHold(pl, hm, pi, true);
-            } else {
-                d = decideClick(pl, mode, pi);
-            }
-        }
+        if (isContinuous(mode)) d = decideHold(pl, mode, pi, push);
+        else if (push) d = decideClick(pl, mode, pi);
+        m_otherOverride = -1;
         if (d.known && d.delay > 0 && d.orb) ++m_orb.delays;
 
         if (d.late > 0 && beginLate(pl, pi, po, mode, d.late)) {   // fatal now, safe k ticks ago: rewound
@@ -1768,7 +1037,7 @@ public:
         ++m_now;
         PlayerObject* p1 = pl->m_player1 ? pl->m_player1 : player;
 
-        {   // measure the real wave slope (degrees) for the HUD + tick dx for CBF partial-tick timing
+        {   // measure the real wave slope (degrees) for the HUD
             float px = p1->getPositionX();
             float py = p1->getPositionY();
             float dx = px - m_prevX;
@@ -1776,20 +1045,19 @@ public:
             if (p1->m_isDart && dx > 0.0001f && dx < 50.f && dy != 0.f && std::fabs(dy) < 80.f) {
                 m_realAngle = std::atan2(std::fabs(dy), dx) * 57.29578f;
             }
-            if (std::fabs(dx) > 0.05f && std::fabs(dx) < 80.f) m_prevTickDx = dx;
-            m_tickStartX = px;
             m_prevX = px;
             m_prevY = py;
         }
         m_load *= 0.97f;
         if (m_noclipTicks > 0) --m_noclipTicks;
 
-        auto& cf = cfg();
         m_layout = layoutOf(pl);
         if (m_layout != m_prevLayout) {
-            // dual / 2-player started or ended: nothing held back may survive the change
+            // dual / 2-player started or ended: nothing held back may survive the change,
+            // and the second player's input state belongs to the old layout
             for (int i = 0; i < 2; ++i) {
-                if (cf.enabled && m_owed[i] && !m_pend[i].empty() && (i == 0 || m_layout == Layout::TwoPlayer)) {
+                if (m_owed[i] && !m_pend[i].empty() && (i == 0 || m_layout != Layout::Solo)) {
+                    // let the game have what it was owed before the switch
                     m_pend[i].clear();
                     m_supp[i] = false;
                     matchPhysical(pl, i);
@@ -1797,23 +1065,22 @@ public:
                 m_pend[i].clear();
                 m_supp[i] = false;
                 m_owed[i] = false;
-                m_stuck[i] = 0;
             }
             if (m_layout == Layout::Solo) {
                 m_phys[1] = false;
                 m_game[1] = false;
-                if (cf.enabled) m_sweep = 6;   // only while mod is enabled
-                else m_sweep = 0;
-            } else {
-                m_sweep = 0;
             }
+            if (m_layout == Layout::Solo) m_sweep = 6;     // back to solo: check nothing stays held
             m_prevLayout = m_layout;
         }
+        auto& cf = cfg();
         if (m_keepTicks > 0 && --m_keepTicks == 0) {
             m_keepOk.clear();
             m_keepFail.clear();
             drawResult();
         }
+
+        histPush(pl);
 
         bool autoOn = cf.autoplay && m_ready && m_layout != Layout::TwoPlayer &&
                       pl->m_player1 && !pl->m_player1->m_isDead;
@@ -1829,35 +1096,20 @@ public:
             m_pend[0].clear();
             m_supp[0] = false;
             matchPhysical(pl, 0);
-            if (m_layout == Layout::TwoPlayer) {
+            if (m_layout != Layout::Solo) {
                 m_pend[1].clear();
                 m_supp[1] = false;
                 matchPhysical(pl, 1);
             }
         }
 
-        // Mod disabled: never touch inputs or run reconcile/m_sweep; release once ONLY if we
-        // had an owed hold right before the user switched Enabled off.
-        if (!cf.enabled) {
-            for (int i = 0; i < 2; ++i) {
-                if (m_owed[i] && m_game[i] && !m_phys[i]) fire(pl, i, false);
-                m_pend[i].clear();
-                m_supp[i] = false;
-                m_owed[i] = false;
-                m_stuck[i] = 0;
-            }
-            m_sweep = 0;
-            m_histN = 0;
-            overlayTick(pl);
-            return;
-        }
-
-        histPush(pl);
-
-        int n = m_layout == Layout::TwoPlayer ? 2 : 1;
+        int n = m_layout == Layout::Solo ? 1 : 2;
         m_justDecided = false;
         for (int pi = 0; pi < n; ++pi) tickPlayer(pl, pi);
-        if (m_ready) reconcile(pl, n);
+        // The safety net also runs for a few ticks after dual ends while the mod is OFF: the game
+        // itself may keep a hold across the close portal (a wave stuck holding), and with the
+        // mod off nothing else would ever release it.
+        if (m_ready && (cf.enabled || m_sweep > 0)) reconcile(pl, n);
         if (!m_justDecided) overlayTick(pl);
     }
 
@@ -1867,13 +1119,8 @@ private:
         auto& c = cfg();
         PlayerObject* po = pi == 0 ? pl->m_player1 : pl->m_player2;
         if (!po) return;
-        bool modeOk = !po->m_isDead && c.maxDelay[detectMode(po)] > 0;
-        if (m_layout == Layout::DualSolo && pl->m_player1 && pl->m_player2) {
-            modeOk = !pl->m_player1->m_isDead && !pl->m_player2->m_isDead &&
-                     (c.maxDelay[detectMode(pl->m_player1)] > 0 ||
-                      c.maxDelay[detectMode(pl->m_player2)] > 0);
-        }
-        bool active = c.enabled && m_ready && modeOk &&
+        Mode mode = detectMode(po);
+        bool active = c.enabled && m_ready && !po->m_isDead && c.maxDelay[mode] > 0 &&
                       !(m_layout == Layout::TwoPlayer && !c.twoPlayerMode) &&
                       !(m_layout == Layout::DualSolo && !c.dualSupport);
         auto& pend = m_pend[pi];
@@ -1893,7 +1140,7 @@ private:
         }
     }
 
-    enum class TouchKind { None, Gravity, Speed, Pad, Size, Mode, Unknown };
+    enum class TouchKind { None, Gravity, Speed, Unknown };
 
     static float speedOf(int id) {
         switch (id) {
@@ -1922,15 +1169,13 @@ private:
                 }
                 return TouchKind::None;
             }
+            // not predicted: the prediction stops here
             case GameObjectType::YellowJumpPad:
             case GameObjectType::PinkJumpPad:
             case GameObjectType::GravityPad:
             case GameObjectType::RedJumpPad:
             case GameObjectType::SpiderPad:
-                return TouchKind::Pad;
-            case GameObjectType::RegularSizePortal:
-            case GameObjectType::MiniSizePortal:
-                return TouchKind::Size;
+            case GameObjectType::TeleportOrb:
             case GameObjectType::ShipPortal:
             case GameObjectType::CubePortal:
             case GameObjectType::BallPortal:
@@ -1939,10 +1184,8 @@ private:
             case GameObjectType::RobotPortal:
             case GameObjectType::SpiderPortal:
             case GameObjectType::SwingPortal:
-                return TouchKind::Mode;
-            // still unpredictable: trigger/custom/teleport/mirror/dual/breakable
-            case GameObjectType::CustomRing:             // trigger / toggle orb
-            case GameObjectType::TeleportOrb:
+            case GameObjectType::RegularSizePortal:
+            case GameObjectType::MiniSizePortal:
             case GameObjectType::InverseMirrorPortal:
             case GameObjectType::NormalMirrorPortal:
             case GameObjectType::DualPortal:
@@ -1973,55 +1216,6 @@ private:
             default: return;
         }
         pl->flipGravity(player, upsideDown, true);
-    }
-
-    // Simulate jump pads cleanly without mutating real level pad activation flags or showing effects.
-    void applyPad(PlayLayer* pl, PlayerObject* player, GameObject* obj, EffectGameObject* eff) {
-        if (!pl || !player || !obj) return;
-        if (obj->m_objectType == GameObjectType::GravityPad) {
-            pl->flipGravity(player, !player->m_isUpsideDown, true);
-            player->propellPlayer(0.8f, true, 67);
-            player->m_touchedPad = true;
-            return;
-        }
-        if (!eff) return;
-        const bool a0 = eff->m_activated;
-        const bool a1 = eff->m_activatedByPlayer1;
-        const bool a2 = eff->m_activatedByPlayer2;
-        const bool a3 = eff->m_isActivated;
-        pl->bumpPlayer(player, eff);
-        eff->m_activated = a0;
-        eff->m_activatedByPlayer1 = a1;
-        eff->m_activatedByPlayer2 = a2;
-        eff->m_isActivated = a3;
-        player->setVisible(false);
-    }
-
-    // Simulate vehicle/mode portals on the ghost without touching PlayLayer's camera or ground borders.
-    void applyModePortal(PlayerObject* p, GameObjectType type) {
-        if (!p) return;
-        if (p->m_isShip && type != GameObjectType::ShipPortal) p->toggleFlyMode(false, true);
-        if (p->m_isBall && type != GameObjectType::BallPortal) p->toggleRollMode(false, true);
-        if (p->m_isDart && type != GameObjectType::WavePortal) p->toggleDartMode(false, true);
-        if (p->m_isRobot && type != GameObjectType::RobotPortal) p->toggleRobotMode(false, true);
-        if (p->m_isSpider && type != GameObjectType::SpiderPortal) p->toggleSpiderMode(false, true);
-        if (p->m_isBird && type != GameObjectType::UfoPortal) p->toggleBirdMode(false, true);
-        if (p->m_isSwing && type != GameObjectType::SwingPortal) p->toggleSwingMode(false, true);
-        switch (type) {
-            case GameObjectType::ShipPortal:   if (!p->m_isShip)   p->toggleFlyMode(true, true); break;
-            case GameObjectType::BallPortal:   if (!p->m_isBall)   p->toggleRollMode(true, true); break;
-            case GameObjectType::WavePortal:   if (!p->m_isDart)   p->toggleDartMode(true, true); break;
-            case GameObjectType::RobotPortal:  if (!p->m_isRobot)  p->toggleRobotMode(true, true); break;
-            case GameObjectType::SpiderPortal: if (!p->m_isSpider) p->toggleSpiderMode(true, true); break;
-            case GameObjectType::UfoPortal:    if (!p->m_isBird)   p->toggleBirdMode(true, true); break;
-            case GameObjectType::SwingPortal:  if (!p->m_isSwing)  p->toggleSwingMode(true, true); break;
-            case GameObjectType::CubePortal:
-            default: break;
-        }
-        p->setVisible(false);
-        if (p->m_waveTrail) p->m_waveTrail->setVisible(false);
-        p->m_isObjectRectDirty = true;
-        p->m_isOrientedBoxDirty = true;
     }
 
     // One line per saved input: "saved +4 ticks | Cube | P1".
@@ -2130,187 +1324,24 @@ private:
         self->m_collisionLogRight->removeAllObjects();
     }
 
-    static bool isHoldingJump(PlayerObject* p) {
-        if (!p) return false;
-        auto it = p->m_holdingButtons.find(static_cast<int>(PlayerButton::Jump));
-        return it != p->m_holdingButtons.end() && it->second;
-    }
-
-    static void simUpdateJumpVars(PlayerObject* p) {
-        if (!p) return;
-        p->m_stateJumpBuffered = p->m_jumpBuffered;
-        p->m_stateRingJump2 = p->m_stateRingJump;
-        p->m_touchedRing = false;
-        p->m_touchedCustomRing = false;
-        p->m_touchedGravityPortal = false;
-        p->m_maybeTouchedBreakableBlock = false;
-    }
-
     void syncPlayer(PlayerObject* sim, PlayerObject* src) {
         sim->setVisible(false);
-        // Only invoke heavy copyAttributes when vehicle / size / orientation actually differs
-        bool modeDiff =
-            sim->m_isShip != src->m_isShip ||
-            sim->m_isBird != src->m_isBird ||
-            sim->m_isBall != src->m_isBall ||
-            sim->m_isDart != src->m_isDart ||
-            sim->m_isRobot != src->m_isRobot ||
-            sim->m_isSpider != src->m_isSpider ||
-            sim->m_isSwing != src->m_isSwing ||
-            sim->m_vehicleSize != src->m_vehicleSize ||
-            sim->m_isSideways != src->m_isSideways ||
-            sim->m_isPlatformer != src->m_isPlatformer;
-        if (sim->m_isDashing && !src->m_isDashing) {
-            sim->stopDashing();
-        }
-        if (modeDiff) {
-            sim->copyAttributes(src);
-        }
-        sim->m_playEffects = false;
-        if (sim->m_waveTrail) sim->m_waveTrail->setVisible(false);
+        sim->copyAttributes(src);
         sim->setPosition(src->getPosition());
-        sim->m_position = src->m_position;
-        sim->m_lastPosition = src->m_lastPosition;
-        sim->setRotation(src->getRotation());
-        sim->setScaleX(src->getScaleX());
-        sim->setScaleY(src->getScaleY());
+        sim->setScale(src->getScale());
         sim->setContentSize(src->getContentSize());
         sim->m_width = src->m_width;
         sim->m_height = src->m_height;
-        sim->m_isObjectRectDirty = true;
-        sim->m_isOrientedBoxDirty = true;
-        sim->m_isSecondPlayer = src->m_isSecondPlayer;
-
-        // 2.2 physics flags (critical so ghost matches 2.2 physics!)
-        sim->m_enable22Changes = src->m_enable22Changes;
-        sim->m_fixRobotJump = src->m_fixRobotJump;
-        sim->m_enableImpulseFix = src->m_enableImpulseFix;
-
-        // Velocity / gravity / speed / direction
         sim->m_gravityMod = src->m_gravityMod;
-        sim->m_gravity = src->m_gravity;
-        sim->m_yVelocity = src->m_yVelocity;
-        sim->m_fallSpeed = src->m_fallSpeed;
-        sim->m_yStart = src->m_yStart;
+        sim->m_isOnGround = src->m_isOnGround;
+        sim->m_isUpsideDown = src->m_isUpsideDown;
         sim->m_vehicleSize = src->m_vehicleSize;
         sim->m_playerSpeed = src->m_playerSpeed;
+        sim->m_yVelocity = src->m_yVelocity;
+        sim->m_gravity = src->m_gravity;
         sim->m_speedMultiplier = src->m_speedMultiplier;
-        sim->m_isUpsideDown = src->m_isUpsideDown;
-        sim->m_isGoingLeft = src->m_isGoingLeft;
-        sim->m_isSideways = src->m_isSideways;
-        sim->m_reverseRelated = src->m_reverseRelated;
-        sim->m_maybeReverseSpeed = src->m_maybeReverseSpeed;
-        sim->m_maybeReverseAcceleration = src->m_maybeReverseAcceleration;
-        sim->m_xVelocityRelated = src->m_xVelocityRelated;
-        sim->m_xVelocityRelated2 = src->m_xVelocityRelated2;
-        sim->m_isAccelerating = src->m_isAccelerating;
-        sim->m_accelerationOrSpeed = src->m_accelerationOrSpeed;
-        sim->m_isDead = false;
-        sim->m_isLocked = src->m_isLocked;
-        sim->m_controlsDisabled = src->m_controlsDisabled;
-        sim->m_inputsLocked = src->m_inputsLocked;
-        sim->m_isOutOfBounds = src->m_isOutOfBounds;
-        sim->m_fallStartY = src->m_fallStartY;
-        sim->m_rotationSpeed = src->m_rotationSpeed;
-        sim->m_rotateSpeed = src->m_rotateSpeed;
-        sim->m_isRotating = src->m_isRotating;
-        sim->m_shipRotation = src->m_shipRotation;
-
-        // Ground & collision state
-        sim->m_isOnGround = src->m_isOnGround;
-        sim->m_isOnGround2 = src->m_isOnGround2;
-        sim->m_isOnGround3 = src->m_isOnGround3;
-        sim->m_isOnGround4 = src->m_isOnGround4;
-        sim->m_stateOnGround = src->m_stateOnGround;
-        sim->m_lastGroundedPos = src->m_lastGroundedPos;
-        sim->m_lastGroundObject = src->m_lastGroundObject;
-        sim->m_collidedObject = src->m_collidedObject;
-        sim->m_collidedTopMinY = src->m_collidedTopMinY;
-        sim->m_collidedBottomMaxY = src->m_collidedBottomMaxY;
-        sim->m_collidedLeftMaxX = src->m_collidedLeftMaxX;
-        sim->m_collidedRightMinX = src->m_collidedRightMinX;
-        sim->m_maybeIsColliding = src->m_maybeIsColliding;
-        sim->m_objectSnappedTo = src->m_objectSnappedTo;
-        sim->m_snapDistance = src->m_snapDistance;
-#if defined(GEODE_COMP_GD_VERSION) && GEODE_COMP_GD_VERSION >= 22090
-        sim->m_ringJumpedSincePress = src->m_ringJumpedSincePress;
-        sim->m_hasStartedFalling = src->m_hasStartedFalling;
-#else
-        sim->m_padRingRelated = src->m_padRingRelated;
-        sim->m_maybeIsFalling = src->m_maybeIsFalling;
-#endif
-
-        // Special blocks (D / J / S / H / F blocks) & forces
-        sim->m_stateDartSlide = src->m_stateDartSlide;
-        sim->m_stateNoAutoJump = src->m_stateNoAutoJump;
-        sim->m_stateHitHead = src->m_stateHitHead;
-        sim->m_stateFlipGravity = src->m_stateFlipGravity;
-#if defined(GEODE_COMP_GD_VERSION) && GEODE_COMP_GD_VERSION >= 22090
-        sim->m_stateNoWallPush = src->m_stateNoWallPush;
-#else
-        sim->m_stateNoStickX = src->m_stateNoStickX;
-        sim->m_stateNoStickY = src->m_stateNoStickY;
-#endif
-        sim->m_stateBoostX = src->m_stateBoostX;
-        sim->m_stateBoostY = src->m_stateBoostY;
-        sim->m_stateScale = src->m_stateScale;
-        sim->m_stateForce = src->m_stateForce;
-        sim->m_stateForceVector = src->m_stateForceVector;
-        sim->m_affectedByForces = src->m_affectedByForces;
-        sim->m_maybeIsBoosted = src->m_maybeIsBoosted;
-        sim->m_decreaseBoostSlide = src->m_decreaseBoostSlide;
-        sim->m_blackOrbRelated = src->m_blackOrbRelated;
-
-        // Slope physics state
-        sim->m_isOnSlope = src->m_isOnSlope;
-        sim->m_wasOnSlope = src->m_wasOnSlope;
-        sim->m_slopeVelocity = src->m_slopeVelocity;
-        sim->m_currentSlopeYVelocity = src->m_currentSlopeYVelocity;
-        sim->m_slopeRotation = src->m_slopeRotation;
-        sim->m_isCurrentSlopeTop = src->m_isCurrentSlopeTop;
-        sim->m_maybeUpsideDownSlope = src->m_maybeUpsideDownSlope;
-        sim->m_maybeGoingCorrectSlopeDirection = src->m_maybeGoingCorrectSlopeDirection;
-        sim->m_maybeSlopeForce = src->m_maybeSlopeForce;
-        sim->m_slopeEndTime = src->m_slopeEndTime;
-        sim->m_currentSlope = src->m_currentSlope;
-        sim->m_currentSlope2 = src->m_currentSlope2;
-
-        // Jump / robot / orb / dash timing state
-        sim->m_totalTime = src->m_totalTime;
-        sim->m_lastJumpTime = src->m_lastJumpTime;
-        sim->m_lastFlipTime = src->m_lastFlipTime;
-        sim->m_lastLandTime = src->m_lastLandTime;
-        sim->m_lastSpiderFlipTime = src->m_lastSpiderFlipTime;
-        sim->m_gameModeChangedTime = src->m_gameModeChangedTime;
-        sim->m_jumpBuffered = src->m_jumpBuffered;
-        sim->m_wasJumpBuffered = src->m_wasJumpBuffered;
-        sim->m_wasRobotJump = src->m_wasRobotJump;
-        sim->m_stateJumpBuffered = src->m_stateJumpBuffered;
-        sim->m_stateRingJump = src->m_stateRingJump;
-        sim->m_stateRingJump2 = src->m_stateRingJump2;
-        sim->m_ringJumpRelated = src->m_ringJumpRelated;
-        sim->m_touchedRing = src->m_touchedRing;
-        sim->m_touchedCustomRing = src->m_touchedCustomRing;
-        sim->m_touchedGravityPortal = src->m_touchedGravityPortal;
-        sim->m_touchedPad = src->m_touchedPad;
-        sim->m_isDashing = src->m_isDashing;
-        sim->m_dashRing = src->m_dashRing;
-        sim->m_dashFireFrame = src->m_dashFireFrame;
-        sim->m_holdingButtons = src->m_holdingButtons;
         sim->m_touchedRings = src->m_touchedRings;
-
-        // Copy currently overlapping rings (so pre-update orb checks match real GD!)
-        if (sim->m_touchingRings) {
-            sim->m_touchingRings->removeAllObjects();
-            if (src->m_touchingRings && src->m_touchingRings->count() > 0) {
-                for (unsigned int i = 0; i < src->m_touchingRings->count(); ++i) {
-                    if (auto* r = src->m_touchingRings->objectAtIndex(i)) {
-                        sim->m_touchingRings->addObject(r);
-                    }
-                }
-            }
-        }
-        resetCollisionLog(sim);
+        if (sim->m_touchingRings) sim->m_touchingRings->removeAllObjects();
     }
 
     void forceHoldObj(int s, int who, bool hold) {
@@ -2321,18 +1352,17 @@ private:
         else p->releaseButton(PlayerButton::Jump);
     }
 
-    // sets the hold state of the TARGET player (and mirrors to the other player in 1-player dual)
+    // sets the hold state of the TARGET player
     void setHold(int s, bool hold) {
         if (m_info[s].holding[m_tp] != hold) forceHoldObj(s, m_tp, hold);
-        if (m_mirror) {
-            int other = 1 - m_tp;
-            if (m_info[s].holding[other] != hold) forceHoldObj(s, other, hold);
-        }
+        if (m_mirror && m_info[s].holding[1] != hold) forceHoldObj(s, 1, hold);
     }
 
-    // hold state the ghost starts with for a player
+    // hold state the ghost starts with for a player (the target's own state is the
+    // one the game has; the other player may be assumed to mirror the target)
     bool holdFor(int who) const {
         if (m_mirror) return m_game[0];
+        if (who != m_tp && m_otherOverride >= 0) return m_otherOverride == 1;
         return m_game[who];
     }
 
@@ -2341,25 +1371,19 @@ private:
         syncPlayer(m_p[0][s], pl->m_player1);
         if (m_two) syncPlayer(m_p[1][s], pl->m_player2);
         m_info[s] = SlotInfo();
-        m_info[s].firstScale = m_loadScale;
         m_info[s].grounded = m_p[m_tp][s]->m_isOnGround;
         m_info[s].groundTicks = m_info[s].grounded ? 1 : 0;
-        // Sync holding[] from real player without firing a fake pushButton() click!
-        // Only call forceHoldObj if holdFor(who) genuinely disagrees with the real player's state.
-        m_info[s].holding[0] = isHoldingJump(m_p[0][s]);
-        if (m_info[s].holding[0] != holdFor(0)) forceHoldObj(s, 0, holdFor(0));
-        if (m_two) {
-            m_info[s].holding[1] = isHoldingJump(m_p[1][s]);
-            if (m_info[s].holding[1] != holdFor(1)) forceHoldObj(s, 1, holdFor(1));
-        }
+        forceHoldObj(s, 0, holdFor(0));
+        if (m_two) forceHoldObj(s, 1, holdFor(1));
     }
 
     void copySlot(int dst, int src) {
         syncPlayer(m_p[0][dst], m_p[0][src]);
         if (m_two) syncPlayer(m_p[1][dst], m_p[1][src]);
-        m_info[dst] = m_info[src];
-        // Note: NEVER call forceHoldObj here — syncPlayer already copied exact button/buffer state;
-        // re-calling pushButton() on a held slot used to trigger phantom UFO/Swing/orb clicks!
+        SlotInfo keep = m_info[src];
+        m_info[dst] = keep;
+        forceHoldObj(dst, 0, keep.holding[0]);
+        if (m_two) forceHoldObj(dst, 1, keep.holding[1]);
     }
 
     CCPoint pos(int s) const { return m_p[m_tp][s]->getPosition(); }
@@ -2382,78 +1406,41 @@ private:
         w->setPosition(CCPoint(w->getPositionX(), y0 + (up ? ndy : -ndy)));
     }
 
-    // One physics tick for a slot. `hold` is the target player's input (mirrored to both players
-    // in 1-player dual). false = a player died or the budget ran out.
+    // One physics tick for a slot. `hold` is the target player's input; the
+    // other player (2-player mode) keeps whatever the game currently has.
+    // false = a player died or the budget ran out.
     bool step(int s, bool hold) {
+        if (m_used >= m_budget) {
+            m_aborted = true;
+            return false;
+        }
+        ++m_used;
         PlayLayer* pl = PlayLayer::get();
         PlayerObject* a = m_p[0][s];
         PlayerObject* b = m_two ? m_p[1][s] : nullptr;
-        // 2-player mode: the two players are independent. Only the target runs.
+        // 2-player mode: the two players are independent. Simulating the other one with a
+        // frozen input made it die in the ghost, which failed EVERY delay of the target
+        // (so nothing was buffered, logged or orb-detected). Only the target runs now.
         if (m_two && m_layout == Layout::TwoPlayer) {
             if (m_tp == 0) b = nullptr;
             else a = nullptr;
         }
-        int cost = (a ? 1 : 0) + (b ? 1 : 0);
-        if (m_used + cost > m_budget) {
-            m_aborted = true;
-            return false;
-        }
-        m_used += cost;
-
         float full = stepDt();
-        float scale = (m_dtScale != 1.f) ? m_dtScale : m_info[s].firstScale;
-        float dt = full * scale;
+        float dt = full * m_dtScale;
         m_stepDtNow = full;
 
-        // Set step context BEFORE setHold() so if pushButton() fires an orb in m_touchingRings,
-        // beforeSimRingJump / afterSimRingJump see the exact current slot and click edge!
         bool wasHold = m_info[s].holding[m_tp];
+        setHold(s, hold);
         m_simDead = false;
         m_stepObj[0] = a;
         m_stepObj[1] = b;
         m_stepEdge[0] = m_stepEdge[1] = false;
         m_orb.done[0] = m_orb.done[1] = false;
         m_stepEdge[m_tp] = hold && !wasHold;
-        if (m_mirror) m_stepEdge[1 - m_tp] = m_stepEdge[m_tp];
+        if (m_mirror) m_stepEdge[1] = m_stepEdge[0];
         m_curSlot = s;
         m_hitUnknown = false;
 
-        setHold(s, hold);
-
-        // If we JUST pressed on a tick where the ghost is already overlapping an unconsumed orb
-        // (carried over in m_touchingRings from the previous tick) and pushButton() didn't fire it
-        // yet, fire the closest one before update(dt) so orbs take priority over UFO/Swing/Cube.
-        auto preUpdateOrb = [&](PlayerObject* p, int who) {
-            if (!p || !m_stepEdge[who] || m_orb.done[who] || !p->m_touchingRings ||
-                p->m_touchingRings->count() == 0 || !canFireOrbNow(p, who)) {
-                return;
-            }
-            CCRect pr = p->getObjectRect();
-            RingObject* best = nullptr;
-            float bestD = std::numeric_limits<float>::max();
-            for (unsigned int i = 0; i < p->m_touchingRings->count(); ++i) {
-                auto* ring = geode::cast::typeinfo_cast<RingObject*>(p->m_touchingRings->objectAtIndex(i));
-                if (!ring || !isSimOrb(ring) || isRingConsumed(s, who, ring)) continue;
-                CCRect rr = ring->getObjectRect();
-                if (!rr.intersectsRect(pr)) continue;
-                float dx = rr.getMidX() - pr.getMidX();
-                float dy = rr.getMidY() - pr.getMidY();
-                float d = dx * dx + dy * dy;
-                if (d < bestD) {
-                    bestD = d;
-                    best = ring;
-                }
-            }
-            if (best) {
-                m_active = p;
-                p->m_stateRingJump = true;
-                p->ringJump(best, true);
-            }
-        };
-        preUpdateOrb(a, 0);
-        preUpdateOrb(b, 1);
-
-        float aPrevX = a ? a->getPositionX() : 0.f;
         if (a) {
             float ax = a->getPositionX();
             float ay = a->getPositionY();
@@ -2474,44 +1461,25 @@ private:
             m_active = nullptr;
             return false;
         }
-        SlotInfo& inf = m_info[s];
-        if (m_partial) {                  // first half of a split tick: collisions run after the second half
-            inf.prevSimTime = inf.simTime;
-            inf.simTime += static_cast<double>(dt) / 60.0;
+        if (m_partial) {                  // first half of a split tick: the game checks collisions once, at the end
             m_active = nullptr;
             return true;
         }
-        if (m_dtScale == 1.f) {           // normal (or CBF-remaining) tick
-            inf.prevSimTime = inf.simTime;
-        }
-        inf.simTime += static_cast<double>(dt) / 60.0;
-        inf.firstScale = 1.f;
 
-        // Check if ghost player 1 crossed any upcoming x-activated Move Trigger on this step
-        if (a) {
-            triggerSimMoves(pl, s, aPrevX, a->getPositionX(), a->getPositionY());
-        } else if (b) {
-            triggerSimMoves(pl, s, b->m_lastPosition.x, b->getPositionX(), b->getPositionY());
-        }
-
-        float colDt = (m_dtScale != 1.f) ? full : dt;
         if (a) {
             m_active = a;
-            if (a->m_touchingRings) a->m_touchingRings->removeAllObjects();
             resetCollisionLog(a);
-            pl->checkCollisions(a, colDt, false);
-            simUpdateJumpVars(a);
+            pl->checkCollisions(a, full, false);
         }
         if (!m_simDead && b) {
             m_active = b;
-            if (b->m_touchingRings) b->m_touchingRings->removeAllObjects();
             resetCollisionLog(b);
-            pl->checkCollisions(b, colDt, false);
-            simUpdateJumpVars(b);
+            pl->checkCollisions(b, full, false);
         }
         m_active = nullptr;
         if (m_simDead) return false;
 
+        SlotInfo& inf = m_info[s];
         if (m_hitUnknown) inf.unknown = true;
         inf.grounded = m_p[m_tp][s]->m_isOnGround;
         inf.groundTicks = inf.grounded ? inf.groundTicks + 1 : 0;
@@ -2527,21 +1495,6 @@ private:
         bool two = m_two;
         m_evGrav = m_evSpeed = m_evUnknown = 0;
         if (two) ensureP2(pl);
-        if (pl && pl->m_player1) {
-            m_realP1X = pl->m_player1->getPositionX();
-            m_realP1Y = pl->m_player1->getPositionY();
-        }
-        pruneMoves();
-        m_groupColCache.clear();
-        // CBF: when a click arrives mid-tick (m_inUpdate == true), estimate how much of the
-        // running tick remains so the ghost's first step lands on the EXACT next tick boundary
-        // where tickPlayer() will fire a delayed input.
-        m_loadScale = 1.f;
-        if (decision && m_inUpdate && pl && pl->m_player1 && std::fabs(m_prevTickDx) > 0.05f) {
-            float frac = (pl->m_player1->getPositionX() - m_tickStartX) / m_prevTickDx;
-            frac = std::clamp(frac, 0.f, 0.95f);
-            m_loadScale = std::clamp(1.f - frac, 0.05f, 1.f);
-        }
         m_simulating = true;
         m_simDead = false;
         m_active = nullptr;
@@ -2564,7 +1517,6 @@ private:
     void endSearch(bool decision = true, bool redraw = true) {
         m_simulating = false;
         m_active = nullptr;
-        m_loadScale = 1.f;
         if (decision && m_wantTrail) {      // keep the click path on screen for a while
             m_keepOk = m_trailOk;
             m_keepFail = m_trailFail;
@@ -2587,19 +1539,19 @@ private:
 
     // ============================================================ click modes
     // Press at the delay, hold a short tap, release, and let physics run.
-    // `horizon` is counted AFTER the click (not from t = 0) so larger delays are verified
-    // for the full jump arc instead of passing early because `d` ate into `horizon`.
+    // true  = survived until a stable landing (ground modes) or the whole
+    //         trajectory (UFO / Swing, which have no ground to settle on).
+    // false = died / budget; `reach` is the tick reached.
+    // `unk` is set when the run only "survived" because it reached something the ghost cannot
+    // predict (pad, orb, portal...): that is not a verified survival.
     bool rollClick(int s, int d, int holdTicks, int horizon, bool airMode, int& reach, bool& unk) {
         int tick = d;
-        int endTick = d + horizon;
         int holdLeft = holdTicks;
         while (true) {
-            if (tick >= endTick) return true;
+            if (tick >= horizon) return true;
             if (!airMode && holdLeft == 0 && m_info[s].groundTicks >= cfg().settle) return true;
             if (m_aborted) return false;
-            bool dashing = m_p[m_tp][s]->m_isDashing || (m_mirror && m_p[1 - m_tp][s] && m_p[1 - m_tp][s]->m_isDashing);
-            bool h = (holdLeft > 0) || dashing;
-            if (!step(s, h)) {
+            if (!step(s, holdLeft > 0)) {
                 noteDeath(s);
                 return false;
             }
@@ -2615,11 +1567,12 @@ private:
     }
 
     // ---- sub-tick search -------------------------------------------------------------
-    // Used ONLY on 1-tick tight windows (when d works but d-1 and d+1 both fail).
-    // Bisects tick d-1 (slot 2 = state at the start of tick d-1) to find the earliest safe fraction,
-    // then aims for the SAFE INTERIOR `(hi + 1.0) * 0.5` instead of the lethal razor edge `hi`.
+    // A delay of d ticks works, d-1 does not: the real limit is somewhere inside tick d-1.
+    // Bisect it with the ghost (slot 2 = state at the start of that tick) and return the part of
+    // the tick after which the click can happen (1 = at the start of tick d, i.e. no gain).
+    // The tick limit (max delay) only bounds the search; the click itself goes where the ghost says.
     bool trialSplit(bool click, int pi, int d, int h, int horizon, bool airMode, bool target, float f, bool groundMode) {
-        orbBegin(false);
+        orbBegin();
         copySlot(1, 2);
         m_info[1].groundTicks = 0;
         m_partial = true;
@@ -2635,13 +1588,14 @@ private:
         if (click) {
             int reach = d;
             bool unk = false;
-            bool good = rollClick(1, d, std::max(0, h - 1), std::max(1, horizon - 1), airMode, reach, unk);
+            bool good = rollClick(1, d, std::max(0, h - 1), horizon, airMode, reach, unk);
+            // a ground mode only counts if the click really does something (jump from the ground, or an orb)
             if (good && groundMode && !m_info[2].grounded && !orbUsed()) return false;
             return good && !unk && !m_aborted;
         }
-        for (int t = 1; t < horizon; ++t) {
+        for (int t = d; t < horizon; ++t) {
             if (!step(1, target)) return false;
-            if (m_info[1].unknown) return false;
+            if (m_info[1].unknown) return false;       // a delay must survive the whole look-ahead
         }
         return !m_aborted;
     }
@@ -2658,57 +1612,35 @@ private:
                 return 1.f;
             }
         }
-        // Stay away from the death edge `hi`: aim for the safe midpoint of [hi, 1.0]
-        return hi < 0.88f ? (hi + 1.f) * 0.5f : 1.f;
-    }
-
-    static bool isGroundMode(Mode m) {
-        return m == M_CUBE || m == M_BALL || m == M_ROBOT || m == M_SPIDER;
+        return hi;
     }
 
     Decision decideClick(PlayLayer* pl, Mode mode, int pi) {
         auto& c = cfg();
         Decision r;
-        bool dual = (m_layout == Layout::DualSolo && pl->m_player1 && pl->m_player2);
-        Mode m0 = dual ? detectMode(pl->m_player1) : mode;
-        Mode m1 = dual ? detectMode(pl->m_player2) : mode;
-
         int maxDelay = c.maxDelay[mode];
-        if (dual) {
-            int d0 = c.maxDelay[m0], d1 = c.maxDelay[m1];
-            maxDelay = (d0 > 0 && d1 > 0) ? std::min(d0, d1) : std::max(d0, d1);
-        }
         if (maxDelay <= 0) return r;
 
-        bool airMode = dual ? (!isGroundMode(m0) || !isGroundMode(m1)) : (mode == M_UFO || mode == M_SWING);
-        // Ground modes only react to a click from the ground (or on an orb). In 1-player dual,
-        // a click is useful if EITHER player is in an air/continuous mode or on the ground.
-        bool groundMode = dual ? (isGroundMode(m0) && isGroundMode(m1)) : isGroundMode(mode);
+        bool airMode = mode == M_UFO || mode == M_SWING;
+        // Cube / ball / robot / spider only react to a click from the ground (or on an orb). A click in
+        // the air that merely "survives" is wasted, so for these the buffer waits for the landing.
+        bool groundMode = mode == M_CUBE || mode == M_BALL || mode == M_ROBOT || mode == M_SPIDER;
         int horizon = airMode ? std::min(c.trajectory, c.airHorizon) : c.trajectory;
-        if (dual && (isContinuous(m0) || isContinuous(m1))) {
-            int contH = (m0 == M_WAVE || m1 == M_WAVE) ? c.waveHorizon : c.shipHorizon;
-            horizon = std::min(horizon, std::max(contH, c.airHorizon));
-        }
         std::vector<int> holds = {c.tapTicks};
-        if (m0 == M_ROBOT || (dual && m1 == M_ROBOT)) holds.push_back(std::max(c.tapTicks, c.robotHold));
+        if (mode == M_ROBOT) holds.push_back(std::max(c.tapTicks, c.robotHold));
 
-        beginSearch(pl, pi, true, dual);
+        beginSearch(pl, pi);
         loadReal(0);
 
-        auto canActAt = [&](int slot) -> bool {
-            if (!groundMode) return true;
-            if (m_p[m_tp][slot]->m_isOnGround) return true;
-            if (dual && m_p[1 - m_tp][slot] && m_p[1 - m_tp][slot]->m_isOnGround) return true;
-            return false;
-        };
-
+        // A delay is "safe" if the click survives. If no delay (0..max) survives, nothing
+        // can be saved: the click goes through raw.
         int foundDelay = -1;
+
         int foundHold = holds[0];
-        bool foundOrb = false;
         bool sawUnknown = false;                 // the prediction ended on something it cannot predict
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
-                copySlot(2, 0);                  // state at the start of tick d-1 (for sub-tick)
+                copySlot(2, 0);                  // state at the start of tick d-1 (for the sub-tick search)
                 if (!step(0, m_game[pi])) {
                     noteDeath(0);
                     break;                       // waiting longer is deadly too
@@ -2721,20 +1653,21 @@ private:
             }
             int reach = d;
             bool ok = false;
-            bool canAct = canActAt(0);
+            bool canAct = !groundMode || m_info[0].grounded;      // slot 0 = state at the start of tick d
             for (int h : holds) {
                 copySlot(1, 0);
                 m_info[1].groundTicks = 0;
                 size_t mark = m_trail.size();
                 trailPush(0, 1);
                 bool unk = false;
+                orbBegin();
                 if (groundMode && !canAct) {
-                    // In the air only an orb hit ON tick `d` itself makes the click reliably useful
-                    // (even for a 1-tick micro-tap). Fast 1-tick probe avoids wasting budget during falls.
-                    orbBegin(false);
+                    // In the air only an orb can make the click useful. Probing 2 ticks is enough to see
+                    // that, so a long fall does not cost a full look-ahead per tick (that used to eat
+                    // the whole budget and the click went through raw: no buffer at all).
                     int r0 = d;
                     bool u0 = false;
-                    bool probe = rollClick(1, d, h, 1, false, r0, u0);
+                    bool probe = rollClick(1, d, h, d + 2, false, r0, u0);
                     if (!probe || !orbUsed()) {
                         m_trail.resize(mark);
                         if (m_aborted) break;
@@ -2742,11 +1675,7 @@ private:
                     }
                     copySlot(1, 0);
                     m_info[1].groundTicks = 0;
-                    orbBegin(false);
-                } else {
-                    // Ground / air-mode click: allow GD-style orb buffering so clicking early into
-                    // a deadly orb ahead is accurately detected!
-                    orbBegin(true);
+                    orbBegin();
                 }
                 ok = rollClick(1, d, h, horizon, airMode, reach, unk);
                 if (ok && unk && d > 0) {             // "cannot predict further" is no rescue
@@ -2757,7 +1686,7 @@ private:
                 if (ok) {
                     foundDelay = d;
                     foundHold = h;
-                    foundOrb = orbUsed();
+                    r.orb = orbUsed();               // this very run is the chosen one
                     if (m_wantTrail) m_trailOk = m_trail;
                     break;
                 }
@@ -2770,46 +1699,8 @@ private:
         if (foundDelay >= 0) {
             r.known = true;
             r.delay = foundDelay;
-            r.orb = foundOrb;
-
-            // Push a delayed click `safeMargin` ticks INTO the safe window so it never fires
-            // on the lethal razor edge (0.1px from dying).
-            if (foundDelay > 0 && !m_aborted) {
-                int margin = std::max(0, c.safeMargin);
-                bool savedPrev = false;
-                if (c.subTick && m_layout == Layout::Solo && !cbfActive()) {
-                    copySlot(4, 2);                   // keep state at foundDelay - 1 before advancing slot 0
-                    savedPrev = true;
-                }
-                int chosen = foundDelay;
-                for (int stepM = 1; stepM <= margin && foundDelay + stepM <= maxDelay; ++stepM) {
-                    int d2 = foundDelay + stepM;
-                    if (!step(0, m_game[pi])) break;
-                    if (m_info[0].unknown) break;
-                    bool canAct2 = canActAt(0);
-                    if (groundMode && !canAct2 && !foundOrb) break;
-                    copySlot(1, 0);
-                    m_info[1].groundTicks = 0;
-                    size_t mark = m_trail.size();
-                    trailPush(0, 1);
-                    orbBegin(!foundOrb && canAct2);
-                    int r2 = d2;
-                    bool u2 = false;
-                    bool ok2 = rollClick(1, d2, foundHold, horizon, airMode, r2, u2);
-                    if (ok2 && !u2 && !m_aborted && (!foundOrb || orbUsed()) && (canAct2 || orbUsed())) {
-                        chosen = d2;
-                        if (m_wantTrail) m_trailOk = m_trail;
-                    } else {
-                        m_trail.resize(mark);
-                        break;                        // reached end of safe window
-                    }
-                }
-                r.delay = chosen;
-                // Only use sub-tick bisect on a true 1-tick tight window (chosen == foundDelay)
-                if (chosen == foundDelay && savedPrev && !m_aborted) {
-                    copySlot(2, 4);
-                    r.frac = refineFrac(true, pi, foundDelay, foundHold, horizon, airMode, false, groundMode);
-                }
+            if (foundDelay > 0 && !m_aborted && c.subTick && m_layout == Layout::Solo && !cbfActive()) {
+                r.frac = refineFrac(true, pi, foundDelay, foundHold, horizon, airMode, false, groundMode);
             }
         } else {
             // no delay saves it. Moving the click back in time comes first, dropping it is the one
@@ -2900,8 +1791,7 @@ private:
         m_info[s] = SlotInfo();
         m_info[s].grounded = m_p[0][s]->m_isOnGround;
         m_info[s].groundTicks = m_info[s].grounded ? 1 : 0;
-        m_info[s].holding[0] = isHoldingJump(m_p[0][s]);
-        if (m_info[s].holding[0] != m_histHold[idx]) forceHoldObj(s, 0, m_histHold[idx]);
+        forceHoldObj(s, 0, m_histHold[idx]);
     }
 
     // Called inside a decide*() search (beginSearch already ran). Returns k > 0 when the input would
@@ -2976,28 +1866,15 @@ private:
     // (jump rotation, robot / spider frames), which looked stiff.
     void copyPhysics(PlayerObject* po, PlayerObject* g) {
         po->setPosition(g->getPosition());
-        po->m_position = g->m_position;
-        po->m_lastPosition = g->m_lastPosition;
-        po->m_isObjectRectDirty = true;
-        po->m_isOrientedBoxDirty = true;
         po->m_gravityMod = g->m_gravityMod;
         po->m_isOnGround = g->m_isOnGround;
-        po->m_isOnGround2 = g->m_isOnGround2;
-        po->m_isOnGround3 = g->m_isOnGround3;
-        po->m_isOnGround4 = g->m_isOnGround4;
-        po->m_stateOnGround = g->m_stateOnGround;
         po->m_isUpsideDown = g->m_isUpsideDown;
         po->m_vehicleSize = g->m_vehicleSize;
         po->m_playerSpeed = g->m_playerSpeed;
         po->m_yVelocity = g->m_yVelocity;
         po->m_gravity = g->m_gravity;
         po->m_speedMultiplier = g->m_speedMultiplier;
-        po->m_isOnSlope = g->m_isOnSlope;
-        po->m_wasOnSlope = g->m_wasOnSlope;
-        po->m_slopeVelocity = g->m_slopeVelocity;
-        po->m_currentSlopeYVelocity = g->m_currentSlopeYVelocity;
-        po->m_totalTime = g->m_totalTime;
-        po->m_lastJumpTime = g->m_lastJumpTime;
+        po->m_lastPosition = g->m_lastPosition;
         po->m_touchedRings = g->m_touchedRings;
         if (po->m_touchingRings) po->m_touchingRings->removeAllObjects();
         resetCollisionLog(po);
@@ -3046,26 +1923,18 @@ private:
     }
 
     // ========================================================= ship / wave
-    // The new hold / release state is assumed to stay for `horizon` ticks AFTER switching at `d`.
-    //  - a delay (0..max) survives the whole post-switch look-ahead -> pushed safeMargin ticks
-    //    into the safe window so it never lands on the lethal edge;
+    // The new hold / release state is assumed to stay for the look-ahead.
+    //  - a delay (0..max) survives the whole look-ahead -> the smallest one wins (a delay that
+    //    only gets there by ending on something unpredictable does not count);
     //  - otherwise nothing can be saved and the input passes raw, so the controls stay free.
     Decision decideHold(PlayLayer* pl, Mode mode, int pi, bool target) {
         auto& c = cfg();
         Decision r;
-        bool dual = (m_layout == Layout::DualSolo && pl->m_player1 && pl->m_player2);
-        Mode m0 = dual ? detectMode(pl->m_player1) : mode;
-        Mode m1 = dual ? detectMode(pl->m_player2) : mode;
         int maxDelay = c.maxDelay[mode];
-        if (dual) {
-            int d0 = c.maxDelay[m0], d1 = c.maxDelay[m1];
-            maxDelay = (d0 > 0 && d1 > 0) ? std::min(d0, d1) : std::max(d0, d1);
-        }
         if (maxDelay <= 0) return r;
-        bool hasWave = (mode == M_WAVE) || (dual && (m0 == M_WAVE || m1 == M_WAVE));
-        int horizon = std::max(1, hasWave ? c.waveHorizon : c.shipHorizon);
+        int horizon = std::max(1, mode == M_WAVE ? c.waveHorizon : c.shipHorizon);
 
-        beginSearch(pl, pi, true, dual);
+        beginSearch(pl, pi);
         loadReal(0);
 
         int foundDelay = -1;
@@ -3074,7 +1943,7 @@ private:
 
         for (int d = 0; d <= maxDelay; ++d) {
             if (d > 0) {
-                copySlot(2, 0);                  // state at the start of tick d-1 (for sub-tick)
+                copySlot(2, 0);                  // state at the start of tick d-1 (for the sub-tick search)
                 if (!step(0, m_game[pi])) {
                     noteDeath(0);
                     break;                       // waiting longer is deadly too
@@ -3087,11 +1956,10 @@ private:
             }
             copySlot(1, 0);
             size_t mark = m_trail.size();
-            orbBegin(target);                    // pressing in Ship/Wave can buffer an orb ahead
             bool alive = true;
             bool ended = false;                  // the run stopped on something unpredictable
-            int reach = 0;
-            for (int t = 0; t < horizon; ++t) {
+            int reach = d;
+            for (int t = d; t < horizon; ++t) {
                 if (!step(1, target)) {
                     noteDeath(1);
                     alive = false;
@@ -3106,7 +1974,8 @@ private:
                 ++reach;
             }
             // Right now an unpredictable object ahead counts as fine (the input just passes).
-            // A DELAY is only a rescue if it survives the whole post-switch look-ahead.
+            // A DELAY is only a rescue if it survives the whole look-ahead: steering towards a
+            // pad / orb / portal until the prediction stops proves nothing.
             if (alive && (d == 0 || !ended)) {
                 foundDelay = d;
                 if (m_wantTrail) m_trailOk = m_trail;
@@ -3120,39 +1989,7 @@ private:
         if (foundDelay > 0 && !m_aborted) {
             r.known = true;
             r.delay = foundDelay;
-            int margin = std::max(0, c.safeMargin);
-            bool savedPrev = false;
             if (c.subTick && m_layout == Layout::Solo && !cbfActive()) {
-                copySlot(4, 2);
-                savedPrev = true;
-            }
-            int chosen = foundDelay;
-            for (int stepM = 1; stepM <= margin && foundDelay + stepM <= maxDelay; ++stepM) {
-                int d2 = foundDelay + stepM;
-                if (!step(0, m_game[pi])) break;
-                if (m_info[0].unknown) break;
-                copySlot(1, 0);
-                size_t mark = m_trail.size();
-                orbBegin(target);
-                bool ok2 = true;
-                for (int t = 0; t < horizon; ++t) {
-                    if (!step(1, target) || m_info[1].unknown) {
-                        ok2 = false;
-                        break;
-                    }
-                    trailPush(1, 0);
-                }
-                if (ok2 && !m_aborted) {
-                    chosen = d2;
-                    if (m_wantTrail) m_trailOk = m_trail;
-                } else {
-                    m_trail.resize(mark);
-                    break;
-                }
-            }
-            r.delay = chosen;
-            if (chosen == foundDelay && savedPrev && !m_aborted) {
-                copySlot(2, 4);
                 r.frac = refineFrac(false, pi, foundDelay, 0, horizon, false, target);
             }
         } else if (foundDelay < 0 && !m_aborted && !sawUnknown) {
@@ -3173,148 +2010,74 @@ private:
     }
 
     // ============================================================ autoplay
-    // The bot drives the input itself:
-    //  * Dynamic per-node mode handling (seamless Cube/Ship/Wave/Ball/UFO/Robot/Spider/Swing transitions)
-    //  * Smart click-mode tapping (avoids accidental auto-jumps & allows crisp multi-orb clicks)
-    //  * 2D spatial blame memory + soft action ordering + rich state memoization
-    //  * Two-pass adaptive resolution (falls back to 1-tick stride on tight gaps/orbs)
-    //  * Periodic mid-plan safety verification watchdog (replans immediately on drift/moving hazards)
-    int aiCellX(float x) const {
+    // The bot drives the input itself. It looks ahead with the ghost (hold /
+    // release segments, fine near the player and coarse far away) and replans
+    // every few ticks from the real state. It learns from every real death:
+    // the actions it took just before dying are blamed for the places they
+    // happened, so the next attempt tries something else there; actions that
+    // survived for a while are forgiven again.
+    int aiCell(float x) const {
         return static_cast<int>(std::floor(x / static_cast<float>(std::max(1, cfg().autoCell))));
     }
 
-    int64_t aiCellKey(float x, float y) const {
-        int64_t cx = static_cast<int64_t>(aiCellX(x));
-        int64_t cy = static_cast<int64_t>(std::floor(y / 36.f));
-        return (cx << 20) ^ (cy & 0xFFFFFLL);
-    }
-
-    float aiBad(int64_t cell, bool hold) const {
+    float aiBad(int cell, bool hold) const {
         auto it = m_ai.find(cell);
         return it == m_ai.end() ? 0.f : it->second.bad[hold ? 1 : 0];
     }
 
     uint64_t aiKey(int s, int level, bool hold) const {
         PlayerObject* a = m_p[0][s];
-        int64_t x = static_cast<int64_t>(aiCellX(a->getPositionX()));
+        int64_t x = static_cast<int64_t>(aiCell(a->getPositionX()));
         int64_t y = static_cast<int64_t>(std::lround(a->getPositionY() * 0.7f));
         int64_t v = static_cast<int64_t>(std::lround(a->m_yVelocity * 6.f));
-        uint64_t flags = static_cast<uint64_t>(detectMode(a)) & 0x7ULL;
-        flags = (flags << 1) | (hold ? 1ULL : 0ULL);
-        flags = (flags << 1) | (a->m_isUpsideDown ? 1ULL : 0ULL);
-        flags = (flags << 1) | (a->m_isOnGround ? 1ULL : 0ULL);
-        flags = (flags << 1) | (a->m_vehicleSize < 0.9f ? 1ULL : 0ULL);
-        flags = (flags << 1) | (a->m_isDashing ? 1ULL : 0ULL);
-        uint64_t k = static_cast<uint64_t>(level & 0x1F);
+        uint64_t k = static_cast<uint64_t>(level & 0xF);
         k = k * 1000003ULL + static_cast<uint64_t>(x + 100000);
         k = k * 1000003ULL + static_cast<uint64_t>(y + 100000);
         k = k * 1000003ULL + static_cast<uint64_t>(v + 100000);
-        k = k * 257ULL + flags;
+        k = k * 2ULL + (hold ? 1ULL : 0ULL);
+        k = k * 2ULL + (a->m_isUpsideDown ? 1ULL : 0ULL);
         return k;
-    }
-
-    void buildAiLevels(int horizon, int s0, bool fineFallback) {
-        m_levels.clear();
-        int maxLevels = kSlots - 2;
-        int total = 0;
-        if (fineFallback) {
-            // Ultra-fine near-term control (1-tick steps for immediate spike/orb timings, then 2-tick, then growing)
-            for (int i = 0; i < 6 && total < horizon && static_cast<int>(m_levels.size()) < maxLevels; ++i) {
-                m_levels.push_back(1);
-                total += 1;
-            }
-            for (int i = 0; i < 5 && total < horizon && static_cast<int>(m_levels.size()) < maxLevels; ++i) {
-                m_levels.push_back(2);
-                total += 2;
-            }
-            s0 = 2;
-        } else {
-            int fine = std::min(10, maxLevels);
-            for (int i = 0; i < fine && total < horizon; ++i) {
-                m_levels.push_back(s0);
-                total += s0;
-            }
-        }
-        int rest = maxLevels - static_cast<int>(m_levels.size());
-        if (total < horizon && rest > 0) {
-            float growth = 1.45f;
-            for (;;) {
-                float seg = static_cast<float>(s0), sum = 0.f;
-                for (int k = 0; k < rest; ++k) {
-                    seg *= growth;
-                    sum += seg;
-                }
-                if (static_cast<float>(total) + sum >= static_cast<float>(horizon) || growth > 60.f) break;
-                growth += 0.15f;
-            }
-            float seg = static_cast<float>(s0);
-            for (int k = 0; k < rest && total < horizon; ++k) {
-                seg *= growth;
-                int sg = std::max(1, static_cast<int>(std::lround(seg)));
-                m_levels.push_back(sg);
-                total += sg;
-            }
-        }
     }
 
     bool aiDfs(int s, int level, int tick, bool prevHold) {
         if (tick >= m_aiHorizon || level >= static_cast<int>(m_levels.size()) ||
             s + 1 >= kSlots) {
             m_planLen = level;
-            m_planEndedUnk = false;
             return true;
         }
         uint64_t key = aiKey(s, level, prevHold);
         if (m_failMemo.count(key)) return false;
 
         int seg = m_levels[level];
-        PlayerObject* curP = m_p[0][s];
-        Mode nodeMode = detectMode(curP);
-        bool nodeCont = isContinuous(nodeMode) || curP->m_isDashing;
-        bool tapMode = !nodeCont && nodeMode != M_ROBOT;
-        int64_t cell = aiCellKey(curP->getPositionX(), curP->getPositionY());
-
-        // Dynamic default per node: click modes prefer release, ship/wave/dash prefer keeping input.
-        bool def = nodeCont ? prevHold : false;
+        int cell = aiCell(m_p[0][s]->getPositionX());
+        // default first: click modes do nothing, ship / wave keep their input. The other
+        // action is only tried when the default dies (or when a branch forces it).
+        bool def = m_aiContinuous ? prevHold : false;
         bool order[2] = {def, !def};
         int count = 2;
         if (level < m_forceLen) {
             order[0] = m_force[level];
             count = 1;
-        } else if (aiBad(cell, order[0]) > aiBad(cell, order[1]) + 0.5f) {
-            std::swap(order[0], order[1]);                 // try less-blamed action first
         }
         float prune = static_cast<float>(cfg().autoPrune);
-        int tapLen = std::max(1, cfg().tapTicks);
 
         for (int k = 0; k < count; ++k) {
             bool h = order[k];
             float bh = aiBad(cell, h);
             float bo = aiBad(cell, !h);
             if (bh >= prune && bo < bh) continue;         // learned: this action killed us here
-
-            // In click modes (Cube/Ball/UFO/Spider/Swing), clicking in a long segment performs a crisp
-            // tap (tapTicks) then releases so the bot doesn't auto-jump into spikes or block the next click.
-            int holdTicks = !h ? 0 : (tapMode ? std::min(seg, tapLen) : seg);
             m_planHold[level] = h;
             m_planSeg[level] = seg;
-            m_planHoldTicks[level] = holdTicks;
-
             copySlot(s + 1, s);
             size_t mark = m_trail.size();
             bool ok = true;
             int stepped = 0;
-            bool endHold = false;
             for (int t = 0; t < seg && tick + t < m_aiHorizon; ++t) {
-                bool dashingNow = m_p[0][s + 1]->m_isDashing ||
-                                  (m_mirror && m_p[1][s + 1] && m_p[1][s + 1]->m_isDashing);
-                bool stepHold = h && (t < holdTicks || dashingNow);
-                if (!step(s + 1, stepHold)) {
+                if (!step(s + 1, h)) {
                     noteDeath(s + 1);
                     ok = false;
                     break;
                 }
-                endHold = stepHold;
                 trailPush(s + 1, 0);
                 ++stepped;
                 if (m_info[s + 1].unknown) break;
@@ -3326,15 +2089,13 @@ private:
                 for (int i = 0; i <= level; ++i) {
                     m_bestHold[i] = m_planHold[i];
                     m_bestSeg[i] = m_planSeg[i];
-                    m_bestHoldTicks[i] = m_planHoldTicks[i];
                 }
             }
             if (ok && m_info[s + 1].unknown) {
-                m_planLen = level + 1;
-                m_planEndedUnk = true;
+                m_planLen = level + 1;                    // cannot predict past this: good enough
                 return true;
             }
-            if (ok && aiDfs(s + 1, level + 1, tick + seg, endHold)) return true;
+            if (ok && aiDfs(s + 1, level + 1, tick + seg, h)) return true;
             m_trail.resize(mark);
             if (m_aborted) return false;
         }
@@ -3350,21 +2111,21 @@ private:
         m_aiNextTotal = 0;
         m_aiNextReady = false;
         m_aiNextTried = false;
-        m_aiVerifyCounter = 0;
     }
 
     // hold state of a route at tick `idx` (past its end: the last one)
     static bool aiHoldAt(std::vector<AiSeg> const& plan, int idx, bool dflt) {
         if (plan.empty()) return dflt;
         int acc = 0;
+        bool h = plan.back().hold;
         for (auto const& st : plan) {
             if (idx < acc + st.seg) {
-                return st.hold && (idx - acc) < st.holdTicks;
+                h = st.hold;
+                break;
             }
             acc += st.seg;
         }
-        auto const& last = plan.back();
-        return last.hold && last.holdTicks >= last.seg;
+        return h;
     }
 
     // Does the plan survive when it is shifted by `shift` ticks (late > 0 / early < 0)?
@@ -3372,52 +2133,70 @@ private:
         copySlot(1, 0);
         for (int t = 0; t < m_aiHorizon; ++t) {
             int idx = t - shift;
-            bool h = idx >= 0 ? aiHoldAt(plan, idx, prev) : prev;
+            bool h = prev;
+            if (idx >= 0) {
+                int acc = 0;
+                h = plan.back().hold;
+                for (auto const& st : plan) {
+                    if (idx < acc + st.seg) {
+                        h = st.hold;
+                        break;
+                    }
+                    acc += st.seg;
+                }
+            }
             if (!step(1, h)) return false;
             if (m_info[1].unknown) break;
         }
         return true;
     }
 
-    // Fast mid-plan safety watchdog: checks if the remainder of m_aiPlan STILL survives
-    // from the real player's exact current state. Catches drift, moving objects, or newly visible spikes early!
-    bool verifyAutoPlan(PlayLayer* pl) {
-        if (m_aiPlan.empty() || m_aiPlanPos >= m_aiPlanTotal) return false;
-        int rem = m_aiPlanTotal - m_aiPlanPos;
-        int checkLen = std::min(rem, std::max(24, cfg().autoHorizon / 2));
-        beginSearch(pl, 0, false, m_layout == Layout::DualSolo);
-        m_wantTrail = false;
-        m_budget = (checkLen + 8) * (m_two ? 2 : 1);
-        orbBegin(true);
-        loadReal(0);
-        bool ok = true;
-        for (int t = 0; t < checkLen; ++t) {
-            bool h = aiHoldAt(m_aiPlan, m_aiPlanPos + t, m_aiHold);
-            if (!step(0, h)) {
-                ok = false;
-                break;
-            }
-            if (m_info[0].unknown) break;
-        }
-        endSearch(false, false);
-        return ok;
-    }
-
     // Route search. A route (pattern) is a hold / release sequence over the look-ahead.
-    //  1. Standard stride pass finds multiple complete routes (via branching from default actions).
-    //  2. If no complete route is found and autoStride > 1, runs a 1-tick fine-resolution fallback
-    //     pass so frame-tight spike/orb timings still succeed!
-    //  3. Of the complete routes the most stable one is followed: survives timing shifts (-2..+2),
-    //     avoids unknown early stops, uses fewer unnecessary switches, and prefers lower-blame paths.
+    //  1. Route 1: "do nothing" until something ahead would kill, then act; go on until the
+    //     look-ahead ends. Dead end (even acting at every step) = that route is over.
+    //  2. Every spot where doing nothing was fine but acting was possible becomes a branch:
+    //     go back to it, act there, and continue the same way from that point (route 2, 3, ...).
+    //  3. Of the complete routes the most stable one is followed: the one that still lives when
+    //     all its timings are shifted by -2..+2 ticks, then the one with fewer switches.
+    // m_aiPlan = the chosen route. true = it survives the whole look-ahead.
+    // lead > 0: build the NEXT route (m_aiNext) instead: it starts where the current route is `lead`
+    // ticks from now (that is, the old route is followed for `lead` ticks first).
     bool planAuto(PlayLayer* pl, int lead = 0) {
         auto& c = cfg();
         bool toNext = lead > 0;
         int s0 = std::max(1, c.autoStride);
         m_aiHorizon = c.autoHorizon;
-        buildAiLevels(m_aiHorizon, s0, false);
+        m_levels.clear();
+        // Decision steps: fine near the player (stride), then growing so that the few levels the
+        // ghost slots allow still cover the whole look-ahead (it can be thousands of ticks).
+        int total = 0;
+        int fine = std::min(6, kSlots - 2);
+        for (int i = 0; i < fine && total < m_aiHorizon; ++i) {
+            m_levels.push_back(s0);
+            total += s0;
+        }
+        int rest = kSlots - 2 - fine;
+        if (total < m_aiHorizon && rest > 0) {
+            float growth = 2.f;                       // doubling is enough for short look-aheads
+            for (;;) {
+                float seg = static_cast<float>(s0), sum = 0.f;
+                for (int k = 0; k < rest; ++k) {
+                    seg *= growth;
+                    sum += seg;
+                }
+                if (static_cast<float>(total) + sum >= static_cast<float>(m_aiHorizon) || growth > 60.f) break;
+                growth += 0.25f;
+            }
+            float seg = static_cast<float>(s0);
+            for (int k = 0; k < rest && total < m_aiHorizon; ++k) {
+                seg *= growth;
+                int sg = std::max(1, static_cast<int>(seg));
+                m_levels.push_back(sg);
+                total += sg;
+            }
+        }
 
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);   // autoplay: one input, both players
-        orbBegin(true);
         loadReal(0);
         m_failMemo.clear();                                        // dead states stay dead for every route
         m_aiContinuous = isContinuous(detectMode(pl->m_player1));
@@ -3435,8 +2214,9 @@ private:
                 }
             }
             prev = h;
-            m_aiContinuous = isContinuous(detectMode(m_p[0][0]));
         }
+        bool genDefault = m_aiContinuous ? prev : false;
+        (void)genDefault;
 
         struct Route {
             std::vector<AiSeg> plan;
@@ -3445,99 +2225,83 @@ private:
             int len = 0;
             int toggles = 0;
             int tol = 0;
-            bool endedUnk = false;
         };
         std::vector<Route> routes;
         std::vector<AiSeg> partial;
         int partialReach = -1;
 
-        auto runPass = [&](int passBudget, int passPaths) {
-            std::deque<std::vector<bool>> seeds;
-            seeds.push_back({});                                   // no forced action = route 1
-            m_aborted = false;
-            m_budget = m_used + passBudget;
-            int attempts = 0;
-            int maxAttempts = passPaths * 8;
+        std::deque<std::vector<bool>> seeds;
+        seeds.push_back({});                                       // no forced action = route 1
+        m_budget = m_used + c.autoBudget;
+        int attempts = 0;
+        int maxAttempts = paths * 8;
 
-            while (!seeds.empty() && static_cast<int>(routes.size()) < passPaths && attempts < maxAttempts) {
-                std::vector<bool> prefix = std::move(seeds.front());
-                seeds.pop_front();
-                if (m_aborted || m_used >= m_budget) break;
-                ++attempts;
+        while (!seeds.empty() && static_cast<int>(routes.size()) < paths && attempts < maxAttempts) {
+            std::vector<bool> prefix = std::move(seeds.front());
+            seeds.pop_front();
+            if (m_aborted || m_used >= m_budget) break;
+            ++attempts;
 
-                m_forceLen = static_cast<int>(prefix.size());
-                for (int i = 0; i < m_forceLen; ++i) m_force[i] = prefix[i];
-                m_bestReach = -1;
-                m_bestLen = 0;
-                m_planLen = 0;
-                m_planEndedUnk = false;
-                m_trail.clear();
-                bool ok = aiDfs(0, 0, 0, prev);
+            m_forceLen = static_cast<int>(prefix.size());
+            for (int i = 0; i < m_forceLen; ++i) m_force[i] = prefix[i];
+            m_bestReach = -1;
+            m_bestLen = 0;
+            m_planLen = 0;
+            m_trail.clear();
+            bool ok = aiDfs(0, 0, 0, prev);
 
-                if (ok && m_planLen > 0) {
-                    std::vector<bool> holds(m_planHold, m_planHold + m_planLen);
-                    bool dup = false;
-                    for (auto const& r : routes) dup = dup || r.holds == holds;
-                    if (!dup) {
-                        Route r;
-                        r.holds = holds;
-                        r.endedUnk = m_planEndedUnk;
-                        bool p = prev;
-                        for (int i = 0; i < m_planLen; ++i) {
-                            r.plan.push_back({m_planHold[i], m_planSeg[i], m_planHoldTicks[i]});
-                            r.len += m_planSeg[i];
-                            if (m_planHold[i] != p) ++r.toggles;
-                            p = m_planHold[i] && m_planHoldTicks[i] >= m_planSeg[i];
-                        }
-                        if (m_wantTrail) r.trail = m_trail;
-                        routes.push_back(std::move(r));
-                    }
-                    // branches: every spot where the default was fine but acting was possible too
+            if (ok && m_planLen > 0) {
+                std::vector<bool> holds(m_planHold, m_planHold + m_planLen);
+                bool dup = false;
+                for (auto const& r : routes) dup = dup || r.holds == holds;
+                if (!dup) {
+                    Route r;
+                    r.holds = holds;
                     bool p = prev;
                     for (int i = 0; i < m_planLen; ++i) {
-                        bool def = m_aiContinuous ? p : false;
-                        if (i >= m_forceLen && m_planHold[i] == def) {
-                            std::vector<bool> seed(m_planHold, m_planHold + i);
-                            seed.push_back(!def);
-                            seeds.push_back(std::move(seed));
-                        }
-                        p = m_planHold[i] && m_planHoldTicks[i] >= m_planSeg[i];
+                        r.plan.push_back({m_planHold[i], m_planSeg[i]});
+                        r.len += m_planSeg[i];
+                        if (m_planHold[i] != p) ++r.toggles;
+                        p = m_planHold[i];
                     }
-                } else if (m_bestReach > partialReach && m_bestLen > 0) {
-                    partialReach = m_bestReach;
-                    partial.clear();
-                    for (int i = 0; i < m_bestLen; ++i) {
-                        partial.push_back({m_bestHold[i], m_bestSeg[i], m_bestHoldTicks[i]});
-                    }
+                    if (m_wantTrail) r.trail = m_trail;
+                    routes.push_back(std::move(r));
                 }
+                // branches: every spot where the default was fine but acting was possible too
+                bool p = prev;
+                for (int i = 0; i < m_planLen; ++i) {
+                    bool def = m_aiContinuous ? p : false;
+                    if (i >= m_forceLen && m_planHold[i] == def) {
+                        std::vector<bool> seed(m_planHold, m_planHold + i);
+                        seed.push_back(!def);
+                        seeds.push_back(std::move(seed));
+                    }
+                    p = m_planHold[i];
+                }
+            } else if (m_bestReach > partialReach && m_bestLen > 0) {
+                partialReach = m_bestReach;
+                partial.clear();
+                for (int i = 0; i < m_bestLen; ++i) partial.push_back({m_bestHold[i], m_bestSeg[i]});
             }
-            m_forceLen = 0;
-        };
-
-        runPass(c.autoBudget, paths);
-
-        // Fine-resolution fallback: if standard stride missed a 1-2 tick spike/orb timing, retry with stride 1!
-        if (routes.empty() && s0 > 1 && !toNext) {
-            buildAiLevels(m_aiHorizon, 1, true);
-            m_failMemo.clear();
-            runPass(std::max(400, c.autoBudget / 2), std::min(paths, 2));
         }
+        m_forceLen = 0;
 
         // stability: survive the same route with every timing shifted
         int best = -1;
         long bestScore = -1;
         if (!routes.empty()) {
             m_aborted = false;
+            // only the longest / simplest few are tested with shifted timings (with hundreds of routes
+            // and a long look-ahead that would cost far more than the search itself)
             constexpr size_t kStab = 16;
             std::vector<size_t> order;
             for (size_t i = 0; i < routes.size(); ++i) order.push_back(i);
             std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-                if (routes[a].endedUnk != routes[b].endedUnk) return !routes[a].endedUnk;
                 if (routes[a].len != routes[b].len) return routes[a].len > routes[b].len;
                 return routes[a].toggles < routes[b].toggles;
             });
             size_t testN = std::min(routes.size(), kStab);
-            m_budget = m_used + (static_cast<int>(testN) * 4 * m_aiHorizon + 64) * (m_two ? 2 : 1);
+            m_budget = m_used + static_cast<int>(testN) * 4 * m_aiHorizon + 64;
             for (size_t k = 0; k < order.size(); ++k) {
                 size_t i = order[k];
                 static constexpr int shifts[4] = {-2, -1, 1, 2};
@@ -3546,8 +2310,7 @@ private:
                         if (aiSurvives(routes[i].plan, sh, prev)) ++routes[i].tol;
                     }
                 }
-                long score = 1000000L + routes[i].tol * 12000L - (routes[i].endedUnk ? 25000L : 0L)
-                           - routes[i].toggles * 90L + routes[i].len;
+                long score = 1000000L + routes[i].tol * 10000L - routes[i].toggles * 100L + routes[i].len;
                 if (score > bestScore) {
                     bestScore = score;
                     best = static_cast<int>(i);
@@ -3567,7 +2330,7 @@ private:
             outPlan = partial;
             outTotal = std::max(1, partialReach);
         } else {
-            outPlan.assign(1, AiSeg{prev, 1, prev ? 1 : 0});
+            outPlan.assign(1, AiSeg{prev, 1});
             useful = false;                                      // nothing was found
         }
         if (toNext) {
@@ -3580,8 +2343,6 @@ private:
             m_aiPlan = std::move(outPlan);
             m_aiPlanTotal = outTotal;
             m_aiPlanPos = 0;
-            m_aiVerifyCounter = 0;
-            m_aiPlanMode = detectMode(pl->m_player1);
         }
         endSearch();
         return ok;
@@ -3593,7 +2354,7 @@ private:
         if (!p1) return;
         ++m_aiTick;
 
-        // forgive what survived long enough (once per 2D spot)
+        // forgive what survived long enough (once per spot)
         while (!m_aiTrail.empty() && m_aiTick - m_aiTrail.front().tick > c.autoForget) {
             AiStep st = m_aiTrail.front();
             m_aiTrail.pop_front();
@@ -3603,27 +2364,12 @@ private:
             if (it != m_ai.end()) it->second.bad[st.hold ? 1 : 0] *= 0.6f;
         }
 
-        // Mid-plan safety watchdog: every 6 ticks (or immediately on a vehicle change), verify that
-        // the current plan still survives from the REAL player's position. If not -> replan NOW!
-        Mode curMode = detectMode(p1);
-        if (!m_aiPlan.empty() && m_aiPlanPos > 0) {
-            bool modeChanged = (curMode != m_aiPlanMode);
-            if (modeChanged || ++m_aiVerifyCounter >= 6) {
-                m_aiVerifyCounter = 0;
-                if (!verifyAutoPlan(pl)) {
-                    clearAutoPlan();
-                } else if (modeChanged) {
-                    m_aiPlanMode = curMode;
-                }
-            }
-        }
-
-        // 60% played: proactively build the next route from where this route is at 75%
-        // (leaves a wide 25% reaction margin instead of waiting until 90%!).
-        if (!m_aiPlan.empty() && !m_aiNextReady && !m_aiNextTried && m_aiPlanPos * 10 >= m_aiPlanTotal * 6) {
+        // 80% played: build the next route at once (nothing waits). It starts from where this route
+        // is at 90%, so it is ready when the 90% mark is reached.
+        if (!m_aiPlan.empty() && !m_aiNextReady && !m_aiNextTried && m_aiPlanPos * 10 >= m_aiPlanTotal * 8) {
             m_aiNextTried = true;
-            int p75 = (m_aiPlanTotal * 3 + 3) / 4;
-            int lead = p75 - m_aiPlanPos;
+            int p90 = (m_aiPlanTotal * 9 + 9) / 10;        // first position that counts as 90% played
+            int lead = p90 - m_aiPlanPos;
             if (lead > 0) {
                 bool ok = planAuto(pl, lead);
                 ++m_dbgSearches;
@@ -3631,14 +2377,12 @@ private:
                                          lead, m_aiNextTotal, m_used);
             }
         }
-        // 75% played (or invalidated by watchdog): switch to next route or replan from real state
-        if (m_aiPlan.empty() || m_aiPlanPos * 4 >= m_aiPlanTotal * 3) {
+        // 90% played: follow the new route from here (it was built for exactly this point)
+        if (m_aiPlan.empty() || m_aiPlanPos * 10 >= m_aiPlanTotal * 9) {
             if (m_aiNextReady && !m_aiPlan.empty()) {
                 m_aiPlan = std::move(m_aiNext);
                 m_aiPlanTotal = m_aiNextTotal;
                 m_aiPlanPos = 0;
-                m_aiPlanMode = curMode;
-                m_aiVerifyCounter = 0;
                 m_aiNext.clear();
             } else {                                        // no next route: plan from the real state
                 bool ok = planAuto(pl);
@@ -3649,12 +2393,19 @@ private:
             m_aiNextReady = false;
             m_aiNextTried = false;
         }
-        bool h = aiHoldAt(m_aiPlan, m_aiPlanPos, m_aiHold);
+        bool h = m_aiHold;
+        int acc = 0;
+        for (auto const& st : m_aiPlan) {
+            h = st.hold;
+            if (m_aiPlanPos < acc + st.seg) break;
+            acc += st.seg;
+        }
         m_aiHold = h;
         ++m_aiPlanPos;
         if (m_game[0] != m_aiHold) fire(pl, 0, m_aiHold);
+        if (m_layout == Layout::DualSolo && m_game[1] != m_aiHold) fire(pl, 1, m_aiHold);
 
-        m_aiTrail.push_back({aiCellKey(p1->getPositionX(), p1->getPositionY()), m_aiHold, m_aiTick});
+        m_aiTrail.push_back({aiCell(p1->getPositionX()), m_aiHold, m_aiTick});
         if (m_aiTrail.size() > 1200) m_aiTrail.pop_front();
     }
 
@@ -3662,9 +2413,9 @@ private:
         auto& c = cfg();
         ++m_aiDeaths;
         if (c.autoLearn) {
-            // blame the actions taken shortly before dying, once per 2D spot,
+            // blame the actions taken shortly before dying, once per spot,
             // the closer to the death the more
-            std::unordered_map<int64_t, float> blame[2];
+            std::unordered_map<int, float> blame[2];
             for (auto const& st : m_aiTrail) {
                 int age = m_aiTick - st.tick;
                 if (age > c.autoWindow) continue;
@@ -3681,7 +2432,7 @@ private:
         m_aiTick = 0;
         m_aiHoldLeft = 0;
         clearAutoPlan();
-        m_aiLastForgiven = {std::numeric_limits<int64_t>::min(), false};
+        m_aiLastForgiven = {std::numeric_limits<int>::min(), false};
     }
 
     // ================================================================ trajectory
@@ -3693,8 +2444,7 @@ private:
     std::vector<TrailPt> simPreview(PlayLayer* pl, bool assumeHold, bool cur, Mode mode) {
         auto& c = cfg();
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);
-        m_budget = (c.previewLen + 8) * (m_two ? 2 : 1);
-        orbBegin(assumeHold);
+        m_budget = c.previewLen + 8;
         loadReal(0);
         // hold: ship / wave (and anything already held) keep holding; click modes
         // that are not held yet get a tap, the way you would really press them
@@ -3780,14 +2530,19 @@ private:
 
         int s0 = std::max(1, c.autoStride);
         m_aiHorizon = c.pathHorizon;
-        buildAiLevels(m_aiHorizon, s0, false);
+        m_levels.clear();
+        int total = 0;
+        for (int i = 0; total < m_aiHorizon && i < kSlots - 2; ++i) {
+            int seg = i < 6 ? s0 : (s0 << std::min(i - 5, 5));
+            m_levels.push_back(seg);
+            total += seg;
+        }
 
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);
         m_budget = c.pathBudget;
         m_forceLen = 0;
         m_aiContinuous = isContinuous(detectMode(p1));
         m_wantTrail = true;                                  // aiDfs records the route in m_trail
-        orbBegin(true);
         loadReal(0);
         m_failMemo.clear();
         m_bestReach = -1;
@@ -3801,14 +2556,13 @@ private:
         } else if (m_bestLen > 0) {
             // nothing survives the whole look-ahead: replay the route that got furthest
             m_aborted = false;
-            m_budget = m_used + (m_aiHorizon + 16) * (m_two ? 2 : 1);
+            m_budget = m_used + m_aiHorizon + 16;
             loadReal(0);
             bool stop = false;
             bool died = false;
             for (int i = 0; i < m_bestLen && !stop; ++i) {
                 for (int t = 0; t < m_bestSeg[i]; ++t) {
-                    bool stepHold = m_bestHold[i] && t < m_bestHoldTicks[i];
-                    if (!step(0, stepHold)) {
+                    if (!step(0, m_bestHold[i])) {
                         died = !m_aborted;
                         stop = true;
                         break;
