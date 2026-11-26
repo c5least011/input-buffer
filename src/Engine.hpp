@@ -74,7 +74,7 @@ public:
     };
 
 private:
-    static constexpr int kSlots = 14;
+    static constexpr int kSlots = 22;
 
     // Simulated (upcoming, not-yet-triggered) move command started when the ghost crosses a move trigger
     struct SimMove {
@@ -193,10 +193,10 @@ private:
         bool hasVel = false;
     };
     std::unordered_map<int, MoveTrack> m_moveTrk;
+    int m_fallbackMovingCount = 0;                 // >0 only when at least one non-trigger-tracked relevant object is moving
     // Move triggers, read straight from GJEffectManager::createMoveCommand (already active)
     // and EffectGameObject (upcoming x-activated triggers). The ghost computes the exact
-    // eased offset at its own simulated time for every object belonging to that group ID,
-    // including the final gap once the move finishes.
+    // eased offset at its own simulated time ONCE per tick into an O(1) generation-stamped table.
     struct MoveCmd {
         int group = 0;
         int controlID = 0;
@@ -209,10 +209,28 @@ private:
         float modX = 1.f, modY = 1.f;
         bool unsupported = false;      // camera lock / stopped / dynamic: cannot be predicted
     };
+    struct MoveCacheEntry {
+        CCPoint off;
+        CCPoint prevOff;
+        bool unsupported = false;
+    };
+    struct GroupObj {
+        GameObject* obj = nullptr;
+        float baseX = 0.f;
+    };
+    static constexpr int kMaxFastGroup = 10000;
     std::vector<MoveCmd> m_moves;                  // running (real) moves
     std::unordered_set<int> m_firedMoveIDs;        // uniqueIDs of real move triggers already fired
     struct MoveTrig { EffectGameObject* obj; float x; int uniqueID; };
     std::vector<MoveTrig> m_moveTrigs;             // x-activated move triggers of the level, sorted by x
+    std::vector<uint32_t> m_moveGen;               // per-group generation stamp for O(1) tick cache
+    std::vector<MoveCacheEntry> m_moveCache;       // per-group cached offset for current ghost tick
+    std::unordered_map<int, MoveCacheEntry> m_moveCacheHi; // overflow for groupID >= kMaxFastGroup
+    uint32_t m_curMoveGen = 1;
+    bool m_tickHasMove = false;                    // true iff any active/sim move exists on this ghost tick
+    std::vector<int> m_tickHorizGroups;            // groups with |off.x| > 15 on this ghost tick
+    std::unordered_map<int, std::vector<GroupObj>> m_groupColCache; // per-search collidable objects per moving group (sorted by x)
+    std::unordered_set<int> m_activeCmdGroups;     // groups currently driven by m_moves (skip in fallback observeObjects)
     float m_ghostPlayerX = 0.f;                    // x of the ghost being collision-checked
     float m_ghostPlayerY = 0.f;
     float m_prevGhostPlayerX = 0.f;                // x/y of the ghost at the previous tick
@@ -253,28 +271,31 @@ private:
     bool m_firing = false;
     float m_load = 0.f;                // recent search load (spam) -> smaller budgets
 
-    // autoplay planner + memory
+    // autoplay planner + memory (2D spatial cells so different heights never alias)
     struct AiCell { float bad[2] = {0.f, 0.f}; };      // [0] release, [1] hold
-    struct AiStep { int cell; bool hold; int tick; };
-    std::unordered_map<int, AiCell> m_ai;
+    struct AiStep { int64_t cell; bool hold; int tick; };
+    std::unordered_map<int64_t, AiCell> m_ai;
     std::deque<AiStep> m_aiTrail;
-    std::pair<int, bool> m_aiLastForgiven{std::numeric_limits<int>::min(), false};
+    std::pair<int64_t, bool> m_aiLastForgiven{std::numeric_limits<int64_t>::min(), false};
     int m_aiTick = 0;
     bool m_aiHold = false;
     int m_aiHoldLeft = 0;
     int m_aiDeaths = 0;
     int m_aiHorizon = 70;
+    int m_aiVerifyCounter = 0;
+    Mode m_aiPlanMode = M_CUBE;
     bool m_autoWas = false;
     std::unordered_set<uint64_t> m_failMemo;
     std::vector<int> m_levels;
     struct AiSeg {
-        bool hold;
-        int seg;
+        bool hold = false;
+        int seg = 1;
+        int holdTicks = 1;             // ticks within `seg` to hold (click modes tap cleanly; continuous holds full seg)
     };
     std::vector<AiSeg> m_aiPlan;       // the route autoplay is following
     int m_aiPlanPos = 0;               // ticks already played of it
     int m_aiPlanTotal = 0;             // its length in ticks
-    std::vector<AiSeg> m_aiNext;       // the next route, built at 80% from where this one is at 90%
+    std::vector<AiSeg> m_aiNext;       // the next route, built proactively at 60% for 75%
     int m_aiNextTotal = 0;
     bool m_aiNextReady = false;
     bool m_aiNextTried = false;        // built (or tried) for the current route already
@@ -283,9 +304,12 @@ private:
     bool m_aiContinuous = false;       // ship / wave: the default is "keep the input"; click modes: "do nothing"
     bool m_planHold[kSlots] = {};
     int m_planSeg[kSlots] = {};
+    int m_planHoldTicks[kSlots] = {};
     int m_planLen = 0;
+    bool m_planEndedUnk = false;
     bool m_bestHold[kSlots] = {};
     int m_bestSeg[kSlots] = {};
+    int m_bestHoldTicks[kSlots] = {};
     int m_bestLen = 0;
     int m_bestReach = -1;
     int m_noclipTicks = 0;             // >0: a death was recently blocked (noclip)
@@ -378,8 +402,72 @@ public:
         m_autoWas = false;
         m_moves.clear();
         m_firedMoveIDs.clear();
+        m_activeCmdGroups.clear();
+        m_groupColCache.clear();
+        m_moveTrk.clear();
+        m_fallbackMovingCount = 0;
+        if (m_moveGen.size() < kMaxFastGroup) {
+            m_moveGen.assign(kMaxFastGroup, 0);
+            m_moveCache.resize(kMaxFastGroup);
+        }
         clearOverlay();
         resetInput();
+    }
+
+    // Fast filter: returns true ONLY for collidable/interactive objects that can affect ghost physics.
+    // Skips 85-95% of objects (Decorations, visual triggers, pulses, etc.) in a single jump table!
+    static bool isRelevantSimObject(GameObject* obj) {
+        if (!obj) return false;
+        if (isSpecialBlock(obj)) return true;
+        switch (obj->m_objectType) {
+            case GameObjectType::Solid:
+            case GameObjectType::Hazard:
+            case GameObjectType::AnimatedHazard:
+            case GameObjectType::CollisionObject:
+            case GameObjectType::Slope:
+            case GameObjectType::Breakable:
+            case GameObjectType::InverseGravityPortal:
+            case GameObjectType::NormalGravityPortal:
+            case GameObjectType::GravityTogglePortal:
+            case GameObjectType::YellowJumpPad:
+            case GameObjectType::PinkJumpPad:
+            case GameObjectType::GravityPad:
+            case GameObjectType::RedJumpPad:
+            case GameObjectType::SpiderPad:
+            case GameObjectType::YellowJumpRing:
+            case GameObjectType::PinkJumpRing:
+            case GameObjectType::GravityRing:
+            case GameObjectType::GreenRing:
+            case GameObjectType::DropRing:
+            case GameObjectType::RedJumpRing:
+            case GameObjectType::SpiderOrb:
+            case GameObjectType::DashRing:
+            case GameObjectType::GravityDashRing:
+            case GameObjectType::CustomRing:
+            case GameObjectType::TeleportOrb:
+            case GameObjectType::ShipPortal:
+            case GameObjectType::CubePortal:
+            case GameObjectType::BallPortal:
+            case GameObjectType::UfoPortal:
+            case GameObjectType::WavePortal:
+            case GameObjectType::RobotPortal:
+            case GameObjectType::SpiderPortal:
+            case GameObjectType::SwingPortal:
+            case GameObjectType::RegularSizePortal:
+            case GameObjectType::MiniSizePortal:
+            case GameObjectType::InverseMirrorPortal:
+            case GameObjectType::NormalMirrorPortal:
+            case GameObjectType::DualPortal:
+            case GameObjectType::SoloPortal:
+            case GameObjectType::TeleportPortal:
+                return true;
+            case GameObjectType::Modifier: {
+                int id = obj->m_objectID;
+                return id == 200 || id == 201 || id == 202 || id == 203 || id == 1334;
+            }
+            default:
+                return false;
+        }
     }
 
     // ================================================================== orbs
@@ -545,6 +633,10 @@ public:
         m_moveTrigs.clear();
         m_moves.clear();
         m_firedMoveIDs.clear();
+        m_activeCmdGroups.clear();
+        m_groupColCache.clear();
+        m_moveTrk.clear();
+        m_fallbackMovingCount = 0;
         m_ready = false;
         m_inUpdate = false;
         m_simulating = false;
@@ -573,13 +665,15 @@ public:
         }
         m_moves.clear();
         m_firedMoveIDs.clear();
+        m_activeCmdGroups.clear();
+        m_groupColCache.clear();
         m_tickStartX = 0.f;
         m_prevTickDx = 0.f;
         m_aiTrail.clear();
         m_aiTick = 0;
         m_aiHoldLeft = 0;
         m_aiHold = false;
-        m_aiLastForgiven = {std::numeric_limits<int>::min(), false};
+        m_aiLastForgiven = {std::numeric_limits<int64_t>::min(), false};
         clearOverlay();
         if (m_draw) m_draw->clear();
     }
@@ -588,6 +682,7 @@ public:
         clearAutoPlan();
         m_moveUntil = 0;
         m_moveTrk.clear();
+        m_fallbackMovingCount = 0;
         m_trailHold.clear();
         m_trailRelease.clear();
         m_pathPts.clear();
@@ -684,8 +779,9 @@ public:
             if (kind == TouchKind::None) continue;
             CCRect orect = obj->getObjectRect();
             if (!orect.intersectsRect(pr)) continue;
-            if (auto eff = geode::cast::typeinfo_cast<EffectGameObject*>(obj)) {
-                if ((kind == TouchKind::Gravity || kind == TouchKind::Speed) &&
+            EffectGameObject* eff = geode::cast::typeinfo_cast<EffectGameObject*>(obj);
+            if (eff) {
+                if ((kind == TouchKind::Gravity || kind == TouchKind::Speed || kind == TouchKind::Pad) &&
                     !eff->m_isMultiActivate &&
                     (who == 0 ? eff->m_activatedByPlayer1 : eff->m_activatedByPlayer2)) {
                     continue;
@@ -698,6 +794,15 @@ public:
             } else if (kind == TouchKind::Speed) {
                 ++m_evSpeed;
                 player->updateTimeMod(speedOf(obj->m_objectID), true);
+            } else if (kind == TouchKind::Pad) {
+                applyPad(pl, player, obj, eff);
+            } else if (kind == TouchKind::Size) {
+                player->togglePlayerScale(obj->m_objectType == GameObjectType::MiniSizePortal, true);
+                player->setVisible(false);
+                player->m_isObjectRectDirty = true;
+                player->m_isOrientedBoxDirty = true;
+            } else if (kind == TouchKind::Mode) {
+                applyModePortal(player, obj->m_objectType);
             } else {
                 ++m_evUnknown;
                 m_hitUnknown = true;
@@ -872,6 +977,23 @@ public:
         cmd.unsupported = lockCameraX || lockCameraY;
         if (m_moves.size() >= 256) m_moves.erase(m_moves.begin());
         m_moves.push_back(cmd);
+        m_activeCmdGroups.insert(groupID);
+    }
+
+    void pruneMoves() {
+        if (m_moves.empty()) {
+            m_activeCmdGroups.clear();
+            return;
+        }
+        double now = m_secClock;
+        size_t before = m_moves.size();
+        m_moves.erase(std::remove_if(m_moves.begin(), m_moves.end(), [&](MoveCmd const& c) {
+            return now > c.start + c.len + 0.15;
+        }), m_moves.end());
+        if (m_moves.size() != before) {
+            m_activeCmdGroups.clear();
+            for (auto const& c : m_moves) m_activeCmdGroups.insert(c.group);
+        }
     }
 
     // Real game: an x/touch/spawn move trigger fired. Remember its uniqueID so the upcoming
@@ -944,6 +1066,10 @@ public:
                         auto* o = static_cast<GameObject*>(arr->objectAtIndex(0));
                         if (!o) return false;
                         out = o->getPosition();
+                        CCPoint prevOff(0.f, 0.f);
+                        if (groupOffsetAt(s, gid, inf.simTime, newX, newY, prevOff) == 1) {
+                            out = out + prevOff;
+                        }
                         return true;
                     };
                     int srcGid = eff->m_targetModCenterID > 0 ? eff->m_targetModCenterID : eff->m_targetGroupID;
@@ -1034,54 +1160,110 @@ public:
             m_prevGhostPlayerX = player->m_lastPosition.x;
             m_prevGhostPlayerY = player->m_lastPosition.y;
         }
+
+        // Precompute exact eased offsets ONCE per ghost tick for every active / simulated
+        // moving group into an O(1) generation-stamped table. Zero per-object trigger scans!
+        m_tickHasMove = false;
+        m_tickHorizGroups.clear();
+        auto const& inf = m_info[m_curSlot];
+        if (!cfg().moveDetect || (m_moves.empty() && inf.simMoves.empty())) return;
+
+        if (++m_curMoveGen == 0) {
+            std::fill(m_moveGen.begin(), m_moveGen.end(), 0);
+            m_curMoveGen = 1;
+        }
+        m_moveCacheHi.clear();
+        if (m_moveGen.size() < kMaxFastGroup) {
+            m_moveGen.assign(kMaxFastGroup, 0);
+            m_moveCache.resize(kMaxFastGroup);
+        }
+
+        double now = m_secClock;
+        auto cacheGroup = [&](int g) {
+            if (g <= 0) return;
+            if (g < kMaxFastGroup) {
+                if (m_moveGen[g] == m_curMoveGen) return;
+                MoveCacheEntry e;
+                int st = groupOffsetAt(m_curSlot, g, inf.simTime, m_ghostPlayerX, m_ghostPlayerY, e.off);
+                if (st < 0) {
+                    e.unsupported = true;
+                } else if (st == 0) {
+                    return;
+                } else {
+                    groupOffsetAt(m_curSlot, g, inf.prevSimTime, m_prevGhostPlayerX, m_prevGhostPlayerY, e.prevOff);
+                    if (std::fabs(e.off.x) > 15.f) m_tickHorizGroups.push_back(g);
+                }
+                m_moveGen[g] = m_curMoveGen;
+                m_moveCache[g] = e;
+                m_tickHasMove = true;
+            } else {
+                if (m_moveCacheHi.find(g) != m_moveCacheHi.end()) return;
+                MoveCacheEntry e;
+                int st = groupOffsetAt(m_curSlot, g, inf.simTime, m_ghostPlayerX, m_ghostPlayerY, e.off);
+                if (st < 0) {
+                    e.unsupported = true;
+                } else if (st == 0) {
+                    return;
+                } else {
+                    groupOffsetAt(m_curSlot, g, inf.prevSimTime, m_prevGhostPlayerX, m_prevGhostPlayerY, e.prevOff);
+                    if (std::fabs(e.off.x) > 15.f) m_tickHorizGroups.push_back(g);
+                }
+                m_moveCacheHi.emplace(g, e);
+                m_tickHasMove = true;
+            }
+        };
+
+        for (auto const& c : m_moves) {
+            if (now < c.start + c.len) cacheGroup(c.group);
+        }
+        for (auto const& sm : inf.simMoves) {
+            if (inf.simTime >= sm.start) cacheGroup(sm.group);
+        }
     }
 
     // If an active or simulated move trigger slides a group horizontally into the ghost's current
-    // collision section from another X section, pull those group objects into `cand` so the ghost
-    // collides with the real final gap after the horizontal move!
+    // collision section from another X section, pull ONLY the nearby collidable objects into `cand`
+    // using a per-search sorted collidable-only group cache (O(log K), skips all Decoration objects!).
     void appendMovingGroupObjects(GJBaseGameLayer* layer, PlayerObject* player, GdVec<GameObject*>& cand) {
-        if (!cfg().moveDetect || !layer || !player) return;
-        if (m_moves.empty() && m_info[m_curSlot].simMoves.empty()) return;
-
-        thread_local std::vector<int> horizGroups;
-        horizGroups.clear();
-        auto checkGroup = [&](int g) {
-            if (g <= 0) return;
-            if (std::find(horizGroups.begin(), horizGroups.end(), g) != horizGroups.end()) return;
-            CCPoint off(0.f, 0.f);
-            if (groupOffsetAt(m_curSlot, g, m_info[m_curSlot].simTime, m_ghostPlayerX, m_ghostPlayerY, off) == 1) {
-                if (std::fabs(off.x) > 15.f) horizGroups.push_back(g);
-            }
-        };
-        for (auto const& c : m_moves) {
-            if (m_secClock < c.start + c.len) checkGroup(c.group);
-        }
-        for (auto const& sm : m_info[m_curSlot].simMoves) checkGroup(sm.group);
-        if (horizGroups.empty()) return;
+        if (!m_tickHasMove || m_tickHorizGroups.empty() || !layer || !player) return;
 
         float px = player->getPositionX();
-        for (int g : horizGroups) {
-            CCArray* arr = layer->getGroup(g);
-            if (!arr || arr->count() == 0) continue;
-            CCPoint off(0.f, 0.f);
-            groupOffsetAt(m_curSlot, g, m_info[m_curSlot].simTime, m_ghostPlayerX, m_ghostPlayerY, off);
-            for (auto* obj : geode::cocos::CCArrayExt<GameObject*>(arr)) {
-                if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
-                auto type = obj->m_objectType;
-                if (type != GameObjectType::Solid &&
-                    type != GameObjectType::Hazard &&
-                    type != GameObjectType::AnimatedHazard &&
-                    type != GameObjectType::CollisionObject &&
-                    type != GameObjectType::Slope &&
-                    type != GameObjectType::Special &&
-                    type != GameObjectType::NormalGravityPortal &&
-                    type != GameObjectType::InverseGravityPortal &&
-                    type != GameObjectType::GravityTogglePortal &&
-                    !isSimOrb(obj)) {
-                    continue;
+        for (int g : m_tickHorizGroups) {
+            MoveCacheEntry const* ent = nullptr;
+            if (g < kMaxFastGroup && m_moveGen[g] == m_curMoveGen) ent = &m_moveCache[g];
+            else {
+                auto hi = m_moveCacheHi.find(g);
+                if (hi != m_moveCacheHi.end()) ent = &hi->second;
+            }
+            if (!ent || ent->unsupported) continue;
+
+            auto cacheIt = m_groupColCache.find(g);
+            if (cacheIt == m_groupColCache.end()) {
+                std::vector<GroupObj> list;
+                if (CCArray* arr = layer->getGroup(g)) {
+                    unsigned int cnt = arr->count();
+                    if (cnt > 0) {
+                        list.reserve(std::min<unsigned int>(cnt, 64));
+                        for (auto* obj : geode::cocos::CCArrayExt<GameObject*>(arr)) {
+                            if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
+                            if (!isRelevantSimObject(obj)) continue;
+                            list.push_back({obj, obj->getPositionX()});
+                        }
+                        std::sort(list.begin(), list.end(),
+                                  [](GroupObj const& a, GroupObj const& b) { return a.baseX < b.baseX; });
+                    }
                 }
-                float predX = obj->getPositionX() + off.x;
-                if (std::fabs(predX - px) > 120.f) continue;
+                cacheIt = m_groupColCache.emplace(g, std::move(list)).first;
+            }
+            auto const& objs = cacheIt->second;
+            if (objs.empty()) continue;
+
+            float loX = px - ent->off.x - 120.f;
+            float hiX = px - ent->off.x + 120.f;
+            auto it = std::lower_bound(objs.begin(), objs.end(), loX,
+                                       [](GroupObj const& a, float x) { return a.baseX < x; });
+            for (; it != objs.end() && it->baseX <= hiX; ++it) {
+                GameObject* obj = it->obj;
                 if (std::find(cand.begin(), cand.end(), obj) == cand.end()) {
                     cand.push_back(obj);
                 }
@@ -1102,13 +1284,31 @@ public:
     float moveFresh() const { return 40.f * std::max(1e-4f, stepDt()); }
 
     // real game, every collision pass of player 1 (fallback for Follow / AreaMove / Practice checkpoints)
+    // Only tracks collidable/interactive objects that are NOT already driven by an active Move Trigger.
     void observeObjects(GdVec<GameObject*>* vec, int count) {
         if (!cfg().moveDetect || !vec) return;
-        if (m_moveTrk.size() > 4000) m_moveTrk.clear();
+        if (m_moveTrk.size() > 2048) {
+            m_moveTrk.clear();
+            m_fallbackMovingCount = 0;
+        }
         double fresh = moveFresh();
+        bool hasActiveCmds = !m_activeCmdGroups.empty();
         for (int i = 0; i < count; ++i) {
             GameObject* o = vec->at(i);
             if (!o || !o->m_groups || o->m_groupCount <= 0 || o->m_groups->at(0) == 0) continue;
+            if (!isRelevantSimObject(o)) continue;
+            if (hasActiveCmds) {
+                bool covered = false;
+                int ng = std::min<int>(o->m_groupCount, 10);
+                for (int k = 0; k < ng; ++k) {
+                    int g = o->m_groups->at(k);
+                    if (g > 0 && m_activeCmdGroups.count(g)) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (covered) continue;
+            }
             auto& t = m_moveTrk[o->m_uniqueID];
             CCPoint p = o->getPosition();
             if (!t.seen) {
@@ -1125,50 +1325,66 @@ public:
                 } else {
                     t.hasVel = false;
                 }
-                t.moving = true;
+                if (!t.moving) {
+                    t.moving = true;
+                    ++m_fallbackMovingCount;
+                }
                 t.last = p;
                 t.changeClock = m_clock;
             } else if (t.moving && m_clock - t.changeClock > fresh) {
                 t.moving = false;
                 t.hasVel = false;
+                if (m_fallbackMovingCount > 0) --m_fallbackMovingCount;
             }
         }
     }
 
     enum class MoveState { Static, Predicted, Unknown };
 
-    // ghost: where is this object at the current and previous simulated ticks?
-    // 1. First computes exact eased offset from active + upcoming Move Triggers matching any group ID of `o`.
-    // 2. Falls back to observed velocity ONLY if no Move Trigger matches AND `o` was observed moving
-    //    (e.g. Follow trigger, Area Move, or respawn mid-move in Practice Mode).
+    bool hasAnySimMove() const {
+        return cfg().moveDetect && (m_tickHasMove || m_fallbackMovingCount > 0);
+    }
+
+    // ghost: O(1) lookup from the per-tick precomputed move cache (zero trigger scans per object!).
+    // Falls back to m_moveTrk ONLY when no Move Trigger matched AND m_fallbackMovingCount > 0.
     MoveState simMove(GameObject* o, CCPoint& offset, CCPoint& prevOffset) {
         offset = CCPoint(0.f, 0.f);
         prevOffset = CCPoint(0.f, 0.f);
-        if (!cfg().moveDetect || !o || !o->m_groups || o->m_groupCount <= 0) return MoveState::Static;
+        if (!cfg().moveDetect || (!m_tickHasMove && m_fallbackMovingCount == 0) ||
+            !o || !o->m_groups || o->m_groupCount <= 0) {
+            return MoveState::Static;
+        }
 
-        int nGroups = std::min<int>(o->m_groupCount, 10);
-        auto const& inf = m_info[m_curSlot];
         bool matchedTrigger = false;
-        if (!m_moves.empty() || !inf.simMoves.empty()) {
+        if (m_tickHasMove) {
+            int nGroups = std::min<int>(o->m_groupCount, 10);
             for (int i = 0; i < nGroups; ++i) {
                 int g = o->m_groups->at(i);
                 if (g <= 0) continue;
-                int stCur = groupOffsetAt(m_curSlot, g, inf.simTime, m_ghostPlayerX, m_ghostPlayerY, offset);
-                if (stCur < 0) return MoveState::Unknown;
-                if (stCur > 0) {
-                    matchedTrigger = true;
-                    groupOffsetAt(m_curSlot, g, inf.prevSimTime, m_prevGhostPlayerX, m_prevGhostPlayerY, prevOffset);
+                MoveCacheEntry const* ent = nullptr;
+                if (g < kMaxFastGroup) {
+                    if (m_moveGen[g] == m_curMoveGen) ent = &m_moveCache[g];
+                } else if (!m_moveCacheHi.empty()) {
+                    auto hi = m_moveCacheHi.find(g);
+                    if (hi != m_moveCacheHi.end()) ent = &hi->second;
                 }
+                if (!ent) continue;
+                if (ent->unsupported) return MoveState::Unknown;
+                matchedTrigger = true;
+                offset = offset + ent->off;
+                prevOffset = prevOffset + ent->prevOff;
             }
         }
         if (matchedTrigger) return MoveState::Predicted;
 
-        // Fallback: no Move Trigger targets any of this object's groups. Check if it moved anyway.
+        // Fallback: no Move Trigger targets any of this object's groups.
+        if (m_fallbackMovingCount <= 0) return MoveState::Static;
         auto it = m_moveTrk.find(o->m_uniqueID);
         if (it == m_moveTrk.end()) return MoveState::Static;
         auto& t = it->second;
         if (!t.moving || m_clock - t.changeClock > moveFresh()) return MoveState::Static;
         if (!t.hasVel) return MoveState::Unknown;
+        auto const& inf = m_info[m_curSlot];
         float elCur = static_cast<float>(inf.simTime * 60.0);
         float elPrev = static_cast<float>(inf.prevSimTime * 60.0);
         offset = t.vel * elCur;
@@ -1446,6 +1662,12 @@ private:
         // that is running (that tick has already been counted).
         long a = m_now + (m_inUpdate ? 0 : 1);
         if (!pend.empty()) {
+            // In continuous modes (Ship / Wave), cap runaway queue buildup during rapid spam
+            // so a single early delay doesn't lock out rescue decisions for the whole spam section.
+            if (isContinuous(detectMode(po)) && pend.size() >= 2) {
+                if (pend.back().push == push) return false;
+                pend.back().tick = std::min(pend.back().tick, a + 1);
+            }
             // an earlier event is still being held back: stay behind it and keep
             // the spacing you had (no new search, nothing is "re-decided")
             long fireAt = pend.back().tick + std::max<long>(1, a - m_arr[pi]);
@@ -1671,7 +1893,7 @@ private:
         }
     }
 
-    enum class TouchKind { None, Gravity, Speed, Unknown };
+    enum class TouchKind { None, Gravity, Speed, Pad, Size, Mode, Unknown };
 
     static float speedOf(int id) {
         switch (id) {
@@ -1700,14 +1922,15 @@ private:
                 }
                 return TouchKind::None;
             }
-            // not predicted: the prediction stops here
             case GameObjectType::YellowJumpPad:
             case GameObjectType::PinkJumpPad:
             case GameObjectType::GravityPad:
             case GameObjectType::RedJumpPad:
             case GameObjectType::SpiderPad:
-            case GameObjectType::CustomRing:             // trigger / toggle orb
-            case GameObjectType::TeleportOrb:
+                return TouchKind::Pad;
+            case GameObjectType::RegularSizePortal:
+            case GameObjectType::MiniSizePortal:
+                return TouchKind::Size;
             case GameObjectType::ShipPortal:
             case GameObjectType::CubePortal:
             case GameObjectType::BallPortal:
@@ -1716,8 +1939,10 @@ private:
             case GameObjectType::RobotPortal:
             case GameObjectType::SpiderPortal:
             case GameObjectType::SwingPortal:
-            case GameObjectType::RegularSizePortal:
-            case GameObjectType::MiniSizePortal:
+                return TouchKind::Mode;
+            // still unpredictable: trigger/custom/teleport/mirror/dual/breakable
+            case GameObjectType::CustomRing:             // trigger / toggle orb
+            case GameObjectType::TeleportOrb:
             case GameObjectType::InverseMirrorPortal:
             case GameObjectType::NormalMirrorPortal:
             case GameObjectType::DualPortal:
@@ -1748,6 +1973,55 @@ private:
             default: return;
         }
         pl->flipGravity(player, upsideDown, true);
+    }
+
+    // Simulate jump pads cleanly without mutating real level pad activation flags or showing effects.
+    void applyPad(PlayLayer* pl, PlayerObject* player, GameObject* obj, EffectGameObject* eff) {
+        if (!pl || !player || !obj) return;
+        if (obj->m_objectType == GameObjectType::GravityPad) {
+            pl->flipGravity(player, !player->m_isUpsideDown, true);
+            player->propellPlayer(0.8f, true, 67);
+            player->m_touchedPad = true;
+            return;
+        }
+        if (!eff) return;
+        const bool a0 = eff->m_activated;
+        const bool a1 = eff->m_activatedByPlayer1;
+        const bool a2 = eff->m_activatedByPlayer2;
+        const bool a3 = eff->m_isActivated;
+        pl->bumpPlayer(player, eff);
+        eff->m_activated = a0;
+        eff->m_activatedByPlayer1 = a1;
+        eff->m_activatedByPlayer2 = a2;
+        eff->m_isActivated = a3;
+        player->setVisible(false);
+    }
+
+    // Simulate vehicle/mode portals on the ghost without touching PlayLayer's camera or ground borders.
+    void applyModePortal(PlayerObject* p, GameObjectType type) {
+        if (!p) return;
+        if (p->m_isShip && type != GameObjectType::ShipPortal) p->toggleFlyMode(false, true);
+        if (p->m_isBall && type != GameObjectType::BallPortal) p->toggleRollMode(false, true);
+        if (p->m_isDart && type != GameObjectType::WavePortal) p->toggleDartMode(false, true);
+        if (p->m_isRobot && type != GameObjectType::RobotPortal) p->toggleRobotMode(false, true);
+        if (p->m_isSpider && type != GameObjectType::SpiderPortal) p->toggleSpiderMode(false, true);
+        if (p->m_isBird && type != GameObjectType::UfoPortal) p->toggleBirdMode(false, true);
+        if (p->m_isSwing && type != GameObjectType::SwingPortal) p->toggleSwingMode(false, true);
+        switch (type) {
+            case GameObjectType::ShipPortal:   if (!p->m_isShip)   p->toggleFlyMode(true, true); break;
+            case GameObjectType::BallPortal:   if (!p->m_isBall)   p->toggleRollMode(true, true); break;
+            case GameObjectType::WavePortal:   if (!p->m_isDart)   p->toggleDartMode(true, true); break;
+            case GameObjectType::RobotPortal:  if (!p->m_isRobot)  p->toggleRobotMode(true, true); break;
+            case GameObjectType::SpiderPortal: if (!p->m_isSpider) p->toggleSpiderMode(true, true); break;
+            case GameObjectType::UfoPortal:    if (!p->m_isBird)   p->toggleBirdMode(true, true); break;
+            case GameObjectType::SwingPortal:  if (!p->m_isSwing)  p->toggleSwingMode(true, true); break;
+            case GameObjectType::CubePortal:
+            default: break;
+        }
+        p->setVisible(false);
+        if (p->m_waveTrail) p->m_waveTrail->setVisible(false);
+        p->m_isObjectRectDirty = true;
+        p->m_isOrientedBoxDirty = true;
     }
 
     // One line per saved input: "saved +4 ticks | Cube | P1".
@@ -1892,6 +2166,8 @@ private:
         if (modeDiff) {
             sim->copyAttributes(src);
         }
+        sim->m_playEffects = false;
+        if (sim->m_waveTrail) sim->m_waveTrail->setVisible(false);
         sim->setPosition(src->getPosition());
         sim->m_position = src->m_position;
         sim->m_lastPosition = src->m_lastPosition;
@@ -1954,6 +2230,15 @@ private:
         sim->m_collidedLeftMaxX = src->m_collidedLeftMaxX;
         sim->m_collidedRightMinX = src->m_collidedRightMinX;
         sim->m_maybeIsColliding = src->m_maybeIsColliding;
+        sim->m_objectSnappedTo = src->m_objectSnappedTo;
+        sim->m_snapDistance = src->m_snapDistance;
+#if defined(GEODE_COMP_GD_VERSION) && GEODE_COMP_GD_VERSION >= 22090
+        sim->m_ringJumpedSincePress = src->m_ringJumpedSincePress;
+        sim->m_hasStartedFalling = src->m_hasStartedFalling;
+#else
+        sim->m_padRingRelated = src->m_padRingRelated;
+        sim->m_maybeIsFalling = src->m_maybeIsFalling;
+#endif
 
         // Special blocks (D / J / S / H / F blocks) & forces
         sim->m_stateDartSlide = src->m_stateDartSlide;
@@ -2246,6 +2531,8 @@ private:
             m_realP1X = pl->m_player1->getPositionX();
             m_realP1Y = pl->m_player1->getPositionY();
         }
+        pruneMoves();
+        m_groupColCache.clear();
         // CBF: when a click arrives mid-tick (m_inUpdate == true), estimate how much of the
         // running tick remains so the ghost's first step lands on the EXACT next tick boundary
         // where tickPlayer() will fire a delayed input.
@@ -2886,74 +3173,148 @@ private:
     }
 
     // ============================================================ autoplay
-    // The bot drives the input itself. It looks ahead with the ghost (hold /
-    // release segments, fine near the player and coarse far away) and replans
-    // every few ticks from the real state. It learns from every real death:
-    // the actions it took just before dying are blamed for the places they
-    // happened, so the next attempt tries something else there; actions that
-    // survived for a while are forgiven again.
-    int aiCell(float x) const {
+    // The bot drives the input itself:
+    //  * Dynamic per-node mode handling (seamless Cube/Ship/Wave/Ball/UFO/Robot/Spider/Swing transitions)
+    //  * Smart click-mode tapping (avoids accidental auto-jumps & allows crisp multi-orb clicks)
+    //  * 2D spatial blame memory + soft action ordering + rich state memoization
+    //  * Two-pass adaptive resolution (falls back to 1-tick stride on tight gaps/orbs)
+    //  * Periodic mid-plan safety verification watchdog (replans immediately on drift/moving hazards)
+    int aiCellX(float x) const {
         return static_cast<int>(std::floor(x / static_cast<float>(std::max(1, cfg().autoCell))));
     }
 
-    float aiBad(int cell, bool hold) const {
+    int64_t aiCellKey(float x, float y) const {
+        int64_t cx = static_cast<int64_t>(aiCellX(x));
+        int64_t cy = static_cast<int64_t>(std::floor(y / 36.f));
+        return (cx << 20) ^ (cy & 0xFFFFFLL);
+    }
+
+    float aiBad(int64_t cell, bool hold) const {
         auto it = m_ai.find(cell);
         return it == m_ai.end() ? 0.f : it->second.bad[hold ? 1 : 0];
     }
 
     uint64_t aiKey(int s, int level, bool hold) const {
         PlayerObject* a = m_p[0][s];
-        int64_t x = static_cast<int64_t>(aiCell(a->getPositionX()));
+        int64_t x = static_cast<int64_t>(aiCellX(a->getPositionX()));
         int64_t y = static_cast<int64_t>(std::lround(a->getPositionY() * 0.7f));
         int64_t v = static_cast<int64_t>(std::lround(a->m_yVelocity * 6.f));
-        uint64_t k = static_cast<uint64_t>(level & 0xF);
+        uint64_t flags = static_cast<uint64_t>(detectMode(a)) & 0x7ULL;
+        flags = (flags << 1) | (hold ? 1ULL : 0ULL);
+        flags = (flags << 1) | (a->m_isUpsideDown ? 1ULL : 0ULL);
+        flags = (flags << 1) | (a->m_isOnGround ? 1ULL : 0ULL);
+        flags = (flags << 1) | (a->m_vehicleSize < 0.9f ? 1ULL : 0ULL);
+        flags = (flags << 1) | (a->m_isDashing ? 1ULL : 0ULL);
+        uint64_t k = static_cast<uint64_t>(level & 0x1F);
         k = k * 1000003ULL + static_cast<uint64_t>(x + 100000);
         k = k * 1000003ULL + static_cast<uint64_t>(y + 100000);
         k = k * 1000003ULL + static_cast<uint64_t>(v + 100000);
-        k = k * 2ULL + (hold ? 1ULL : 0ULL);
-        k = k * 2ULL + (a->m_isUpsideDown ? 1ULL : 0ULL);
+        k = k * 257ULL + flags;
         return k;
+    }
+
+    void buildAiLevels(int horizon, int s0, bool fineFallback) {
+        m_levels.clear();
+        int maxLevels = kSlots - 2;
+        int total = 0;
+        if (fineFallback) {
+            // Ultra-fine near-term control (1-tick steps for immediate spike/orb timings, then 2-tick, then growing)
+            for (int i = 0; i < 6 && total < horizon && static_cast<int>(m_levels.size()) < maxLevels; ++i) {
+                m_levels.push_back(1);
+                total += 1;
+            }
+            for (int i = 0; i < 5 && total < horizon && static_cast<int>(m_levels.size()) < maxLevels; ++i) {
+                m_levels.push_back(2);
+                total += 2;
+            }
+            s0 = 2;
+        } else {
+            int fine = std::min(10, maxLevels);
+            for (int i = 0; i < fine && total < horizon; ++i) {
+                m_levels.push_back(s0);
+                total += s0;
+            }
+        }
+        int rest = maxLevels - static_cast<int>(m_levels.size());
+        if (total < horizon && rest > 0) {
+            float growth = 1.45f;
+            for (;;) {
+                float seg = static_cast<float>(s0), sum = 0.f;
+                for (int k = 0; k < rest; ++k) {
+                    seg *= growth;
+                    sum += seg;
+                }
+                if (static_cast<float>(total) + sum >= static_cast<float>(horizon) || growth > 60.f) break;
+                growth += 0.15f;
+            }
+            float seg = static_cast<float>(s0);
+            for (int k = 0; k < rest && total < horizon; ++k) {
+                seg *= growth;
+                int sg = std::max(1, static_cast<int>(std::lround(seg)));
+                m_levels.push_back(sg);
+                total += sg;
+            }
+        }
     }
 
     bool aiDfs(int s, int level, int tick, bool prevHold) {
         if (tick >= m_aiHorizon || level >= static_cast<int>(m_levels.size()) ||
             s + 1 >= kSlots) {
             m_planLen = level;
+            m_planEndedUnk = false;
             return true;
         }
         uint64_t key = aiKey(s, level, prevHold);
         if (m_failMemo.count(key)) return false;
 
         int seg = m_levels[level];
-        int cell = aiCell(m_p[0][s]->getPositionX());
-        // default first: click modes do nothing, ship / wave keep their input. The other
-        // action is only tried when the default dies (or when a branch forces it).
-        bool def = m_aiContinuous ? prevHold : false;
+        PlayerObject* curP = m_p[0][s];
+        Mode nodeMode = detectMode(curP);
+        bool nodeCont = isContinuous(nodeMode) || curP->m_isDashing;
+        bool tapMode = !nodeCont && nodeMode != M_ROBOT;
+        int64_t cell = aiCellKey(curP->getPositionX(), curP->getPositionY());
+
+        // Dynamic default per node: click modes prefer release, ship/wave/dash prefer keeping input.
+        bool def = nodeCont ? prevHold : false;
         bool order[2] = {def, !def};
         int count = 2;
         if (level < m_forceLen) {
             order[0] = m_force[level];
             count = 1;
+        } else if (aiBad(cell, order[0]) > aiBad(cell, order[1]) + 0.5f) {
+            std::swap(order[0], order[1]);                 // try less-blamed action first
         }
         float prune = static_cast<float>(cfg().autoPrune);
+        int tapLen = std::max(1, cfg().tapTicks);
 
         for (int k = 0; k < count; ++k) {
             bool h = order[k];
             float bh = aiBad(cell, h);
             float bo = aiBad(cell, !h);
             if (bh >= prune && bo < bh) continue;         // learned: this action killed us here
+
+            // In click modes (Cube/Ball/UFO/Spider/Swing), clicking in a long segment performs a crisp
+            // tap (tapTicks) then releases so the bot doesn't auto-jump into spikes or block the next click.
+            int holdTicks = !h ? 0 : (tapMode ? std::min(seg, tapLen) : seg);
             m_planHold[level] = h;
             m_planSeg[level] = seg;
+            m_planHoldTicks[level] = holdTicks;
+
             copySlot(s + 1, s);
             size_t mark = m_trail.size();
             bool ok = true;
             int stepped = 0;
+            bool endHold = false;
             for (int t = 0; t < seg && tick + t < m_aiHorizon; ++t) {
-                if (!step(s + 1, h)) {
+                bool dashingNow = m_p[0][s + 1]->m_isDashing ||
+                                  (m_mirror && m_p[1][s + 1] && m_p[1][s + 1]->m_isDashing);
+                bool stepHold = h && (t < holdTicks || dashingNow);
+                if (!step(s + 1, stepHold)) {
                     noteDeath(s + 1);
                     ok = false;
                     break;
                 }
+                endHold = stepHold;
                 trailPush(s + 1, 0);
                 ++stepped;
                 if (m_info[s + 1].unknown) break;
@@ -2965,13 +3326,15 @@ private:
                 for (int i = 0; i <= level; ++i) {
                     m_bestHold[i] = m_planHold[i];
                     m_bestSeg[i] = m_planSeg[i];
+                    m_bestHoldTicks[i] = m_planHoldTicks[i];
                 }
             }
             if (ok && m_info[s + 1].unknown) {
-                m_planLen = level + 1;                    // cannot predict past this: good enough
+                m_planLen = level + 1;
+                m_planEndedUnk = true;
                 return true;
             }
-            if (ok && aiDfs(s + 1, level + 1, tick + seg, h)) return true;
+            if (ok && aiDfs(s + 1, level + 1, tick + seg, endHold)) return true;
             m_trail.resize(mark);
             if (m_aborted) return false;
         }
@@ -2987,21 +3350,21 @@ private:
         m_aiNextTotal = 0;
         m_aiNextReady = false;
         m_aiNextTried = false;
+        m_aiVerifyCounter = 0;
     }
 
     // hold state of a route at tick `idx` (past its end: the last one)
     static bool aiHoldAt(std::vector<AiSeg> const& plan, int idx, bool dflt) {
         if (plan.empty()) return dflt;
         int acc = 0;
-        bool h = plan.back().hold;
         for (auto const& st : plan) {
             if (idx < acc + st.seg) {
-                h = st.hold;
-                break;
+                return st.hold && (idx - acc) < st.holdTicks;
             }
             acc += st.seg;
         }
-        return h;
+        auto const& last = plan.back();
+        return last.hold && last.holdTicks >= last.seg;
     }
 
     // Does the plan survive when it is shifted by `shift` ticks (late > 0 / early < 0)?
@@ -3009,68 +3372,49 @@ private:
         copySlot(1, 0);
         for (int t = 0; t < m_aiHorizon; ++t) {
             int idx = t - shift;
-            bool h = prev;
-            if (idx >= 0) {
-                int acc = 0;
-                h = plan.back().hold;
-                for (auto const& st : plan) {
-                    if (idx < acc + st.seg) {
-                        h = st.hold;
-                        break;
-                    }
-                    acc += st.seg;
-                }
-            }
+            bool h = idx >= 0 ? aiHoldAt(plan, idx, prev) : prev;
             if (!step(1, h)) return false;
             if (m_info[1].unknown) break;
         }
         return true;
     }
 
+    // Fast mid-plan safety watchdog: checks if the remainder of m_aiPlan STILL survives
+    // from the real player's exact current state. Catches drift, moving objects, or newly visible spikes early!
+    bool verifyAutoPlan(PlayLayer* pl) {
+        if (m_aiPlan.empty() || m_aiPlanPos >= m_aiPlanTotal) return false;
+        int rem = m_aiPlanTotal - m_aiPlanPos;
+        int checkLen = std::min(rem, std::max(24, cfg().autoHorizon / 2));
+        beginSearch(pl, 0, false, m_layout == Layout::DualSolo);
+        m_wantTrail = false;
+        m_budget = (checkLen + 8) * (m_two ? 2 : 1);
+        orbBegin(true);
+        loadReal(0);
+        bool ok = true;
+        for (int t = 0; t < checkLen; ++t) {
+            bool h = aiHoldAt(m_aiPlan, m_aiPlanPos + t, m_aiHold);
+            if (!step(0, h)) {
+                ok = false;
+                break;
+            }
+            if (m_info[0].unknown) break;
+        }
+        endSearch(false, false);
+        return ok;
+    }
+
     // Route search. A route (pattern) is a hold / release sequence over the look-ahead.
-    //  1. Route 1: "do nothing" until something ahead would kill, then act; go on until the
-    //     look-ahead ends. Dead end (even acting at every step) = that route is over.
-    //  2. Every spot where doing nothing was fine but acting was possible becomes a branch:
-    //     go back to it, act there, and continue the same way from that point (route 2, 3, ...).
-    //  3. Of the complete routes the most stable one is followed: the one that still lives when
-    //     all its timings are shifted by -2..+2 ticks, then the one with fewer switches.
-    // m_aiPlan = the chosen route. true = it survives the whole look-ahead.
-    // lead > 0: build the NEXT route (m_aiNext) instead: it starts where the current route is `lead`
-    // ticks from now (that is, the old route is followed for `lead` ticks first).
+    //  1. Standard stride pass finds multiple complete routes (via branching from default actions).
+    //  2. If no complete route is found and autoStride > 1, runs a 1-tick fine-resolution fallback
+    //     pass so frame-tight spike/orb timings still succeed!
+    //  3. Of the complete routes the most stable one is followed: survives timing shifts (-2..+2),
+    //     avoids unknown early stops, uses fewer unnecessary switches, and prefers lower-blame paths.
     bool planAuto(PlayLayer* pl, int lead = 0) {
         auto& c = cfg();
         bool toNext = lead > 0;
         int s0 = std::max(1, c.autoStride);
         m_aiHorizon = c.autoHorizon;
-        m_levels.clear();
-        // Decision steps: fine near the player (stride), then growing so that the few levels the
-        // ghost slots allow still cover the whole look-ahead (it can be thousands of ticks).
-        int total = 0;
-        int fine = std::min(6, kSlots - 2);
-        for (int i = 0; i < fine && total < m_aiHorizon; ++i) {
-            m_levels.push_back(s0);
-            total += s0;
-        }
-        int rest = kSlots - 2 - fine;
-        if (total < m_aiHorizon && rest > 0) {
-            float growth = 2.f;                       // doubling is enough for short look-aheads
-            for (;;) {
-                float seg = static_cast<float>(s0), sum = 0.f;
-                for (int k = 0; k < rest; ++k) {
-                    seg *= growth;
-                    sum += seg;
-                }
-                if (static_cast<float>(total) + sum >= static_cast<float>(m_aiHorizon) || growth > 60.f) break;
-                growth += 0.25f;
-            }
-            float seg = static_cast<float>(s0);
-            for (int k = 0; k < rest && total < m_aiHorizon; ++k) {
-                seg *= growth;
-                int sg = std::max(1, static_cast<int>(seg));
-                m_levels.push_back(sg);
-                total += sg;
-            }
-        }
+        buildAiLevels(m_aiHorizon, s0, false);
 
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);   // autoplay: one input, both players
         orbBegin(true);
@@ -3091,9 +3435,8 @@ private:
                 }
             }
             prev = h;
+            m_aiContinuous = isContinuous(detectMode(m_p[0][0]));
         }
-        bool genDefault = m_aiContinuous ? prev : false;
-        (void)genDefault;
 
         struct Route {
             std::vector<AiSeg> plan;
@@ -3102,78 +3445,94 @@ private:
             int len = 0;
             int toggles = 0;
             int tol = 0;
+            bool endedUnk = false;
         };
         std::vector<Route> routes;
         std::vector<AiSeg> partial;
         int partialReach = -1;
 
-        std::deque<std::vector<bool>> seeds;
-        seeds.push_back({});                                       // no forced action = route 1
-        m_budget = m_used + c.autoBudget;
-        int attempts = 0;
-        int maxAttempts = paths * 8;
+        auto runPass = [&](int passBudget, int passPaths) {
+            std::deque<std::vector<bool>> seeds;
+            seeds.push_back({});                                   // no forced action = route 1
+            m_aborted = false;
+            m_budget = m_used + passBudget;
+            int attempts = 0;
+            int maxAttempts = passPaths * 8;
 
-        while (!seeds.empty() && static_cast<int>(routes.size()) < paths && attempts < maxAttempts) {
-            std::vector<bool> prefix = std::move(seeds.front());
-            seeds.pop_front();
-            if (m_aborted || m_used >= m_budget) break;
-            ++attempts;
+            while (!seeds.empty() && static_cast<int>(routes.size()) < passPaths && attempts < maxAttempts) {
+                std::vector<bool> prefix = std::move(seeds.front());
+                seeds.pop_front();
+                if (m_aborted || m_used >= m_budget) break;
+                ++attempts;
 
-            m_forceLen = static_cast<int>(prefix.size());
-            for (int i = 0; i < m_forceLen; ++i) m_force[i] = prefix[i];
-            m_bestReach = -1;
-            m_bestLen = 0;
-            m_planLen = 0;
-            m_trail.clear();
-            bool ok = aiDfs(0, 0, 0, prev);
+                m_forceLen = static_cast<int>(prefix.size());
+                for (int i = 0; i < m_forceLen; ++i) m_force[i] = prefix[i];
+                m_bestReach = -1;
+                m_bestLen = 0;
+                m_planLen = 0;
+                m_planEndedUnk = false;
+                m_trail.clear();
+                bool ok = aiDfs(0, 0, 0, prev);
 
-            if (ok && m_planLen > 0) {
-                std::vector<bool> holds(m_planHold, m_planHold + m_planLen);
-                bool dup = false;
-                for (auto const& r : routes) dup = dup || r.holds == holds;
-                if (!dup) {
-                    Route r;
-                    r.holds = holds;
+                if (ok && m_planLen > 0) {
+                    std::vector<bool> holds(m_planHold, m_planHold + m_planLen);
+                    bool dup = false;
+                    for (auto const& r : routes) dup = dup || r.holds == holds;
+                    if (!dup) {
+                        Route r;
+                        r.holds = holds;
+                        r.endedUnk = m_planEndedUnk;
+                        bool p = prev;
+                        for (int i = 0; i < m_planLen; ++i) {
+                            r.plan.push_back({m_planHold[i], m_planSeg[i], m_planHoldTicks[i]});
+                            r.len += m_planSeg[i];
+                            if (m_planHold[i] != p) ++r.toggles;
+                            p = m_planHold[i] && m_planHoldTicks[i] >= m_planSeg[i];
+                        }
+                        if (m_wantTrail) r.trail = m_trail;
+                        routes.push_back(std::move(r));
+                    }
+                    // branches: every spot where the default was fine but acting was possible too
                     bool p = prev;
                     for (int i = 0; i < m_planLen; ++i) {
-                        r.plan.push_back({m_planHold[i], m_planSeg[i]});
-                        r.len += m_planSeg[i];
-                        if (m_planHold[i] != p) ++r.toggles;
-                        p = m_planHold[i];
+                        bool def = m_aiContinuous ? p : false;
+                        if (i >= m_forceLen && m_planHold[i] == def) {
+                            std::vector<bool> seed(m_planHold, m_planHold + i);
+                            seed.push_back(!def);
+                            seeds.push_back(std::move(seed));
+                        }
+                        p = m_planHold[i] && m_planHoldTicks[i] >= m_planSeg[i];
                     }
-                    if (m_wantTrail) r.trail = m_trail;
-                    routes.push_back(std::move(r));
-                }
-                // branches: every spot where the default was fine but acting was possible too
-                bool p = prev;
-                for (int i = 0; i < m_planLen; ++i) {
-                    bool def = m_aiContinuous ? p : false;
-                    if (i >= m_forceLen && m_planHold[i] == def) {
-                        std::vector<bool> seed(m_planHold, m_planHold + i);
-                        seed.push_back(!def);
-                        seeds.push_back(std::move(seed));
+                } else if (m_bestReach > partialReach && m_bestLen > 0) {
+                    partialReach = m_bestReach;
+                    partial.clear();
+                    for (int i = 0; i < m_bestLen; ++i) {
+                        partial.push_back({m_bestHold[i], m_bestSeg[i], m_bestHoldTicks[i]});
                     }
-                    p = m_planHold[i];
                 }
-            } else if (m_bestReach > partialReach && m_bestLen > 0) {
-                partialReach = m_bestReach;
-                partial.clear();
-                for (int i = 0; i < m_bestLen; ++i) partial.push_back({m_bestHold[i], m_bestSeg[i]});
             }
+            m_forceLen = 0;
+        };
+
+        runPass(c.autoBudget, paths);
+
+        // Fine-resolution fallback: if standard stride missed a 1-2 tick spike/orb timing, retry with stride 1!
+        if (routes.empty() && s0 > 1 && !toNext) {
+            buildAiLevels(m_aiHorizon, 1, true);
+            m_failMemo.clear();
+            runPass(std::max(400, c.autoBudget / 2), std::min(paths, 2));
         }
-        m_forceLen = 0;
 
         // stability: survive the same route with every timing shifted
         int best = -1;
         long bestScore = -1;
         if (!routes.empty()) {
             m_aborted = false;
-            // only the longest / simplest few are tested with shifted timings (with hundreds of routes
-            // and a long look-ahead that would cost far more than the search itself)
             constexpr size_t kStab = 16;
             std::vector<size_t> order;
             for (size_t i = 0; i < routes.size(); ++i) order.push_back(i);
             std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                if (routes[a].endedUnk != routes[b].endedUnk) return !routes[a].endedUnk;
                 if (routes[a].len != routes[b].len) return routes[a].len > routes[b].len;
                 return routes[a].toggles < routes[b].toggles;
             });
@@ -3187,7 +3546,8 @@ private:
                         if (aiSurvives(routes[i].plan, sh, prev)) ++routes[i].tol;
                     }
                 }
-                long score = 1000000L + routes[i].tol * 10000L - routes[i].toggles * 100L + routes[i].len;
+                long score = 1000000L + routes[i].tol * 12000L - (routes[i].endedUnk ? 25000L : 0L)
+                           - routes[i].toggles * 90L + routes[i].len;
                 if (score > bestScore) {
                     bestScore = score;
                     best = static_cast<int>(i);
@@ -3207,7 +3567,7 @@ private:
             outPlan = partial;
             outTotal = std::max(1, partialReach);
         } else {
-            outPlan.assign(1, AiSeg{prev, 1});
+            outPlan.assign(1, AiSeg{prev, 1, prev ? 1 : 0});
             useful = false;                                      // nothing was found
         }
         if (toNext) {
@@ -3220,6 +3580,8 @@ private:
             m_aiPlan = std::move(outPlan);
             m_aiPlanTotal = outTotal;
             m_aiPlanPos = 0;
+            m_aiVerifyCounter = 0;
+            m_aiPlanMode = detectMode(pl->m_player1);
         }
         endSearch();
         return ok;
@@ -3231,7 +3593,7 @@ private:
         if (!p1) return;
         ++m_aiTick;
 
-        // forgive what survived long enough (once per spot)
+        // forgive what survived long enough (once per 2D spot)
         while (!m_aiTrail.empty() && m_aiTick - m_aiTrail.front().tick > c.autoForget) {
             AiStep st = m_aiTrail.front();
             m_aiTrail.pop_front();
@@ -3241,12 +3603,27 @@ private:
             if (it != m_ai.end()) it->second.bad[st.hold ? 1 : 0] *= 0.6f;
         }
 
-        // 80% played: build the next route at once (nothing waits). It starts from where this route
-        // is at 90%, so it is ready when the 90% mark is reached.
-        if (!m_aiPlan.empty() && !m_aiNextReady && !m_aiNextTried && m_aiPlanPos * 10 >= m_aiPlanTotal * 8) {
+        // Mid-plan safety watchdog: every 6 ticks (or immediately on a vehicle change), verify that
+        // the current plan still survives from the REAL player's position. If not -> replan NOW!
+        Mode curMode = detectMode(p1);
+        if (!m_aiPlan.empty() && m_aiPlanPos > 0) {
+            bool modeChanged = (curMode != m_aiPlanMode);
+            if (modeChanged || ++m_aiVerifyCounter >= 6) {
+                m_aiVerifyCounter = 0;
+                if (!verifyAutoPlan(pl)) {
+                    clearAutoPlan();
+                } else if (modeChanged) {
+                    m_aiPlanMode = curMode;
+                }
+            }
+        }
+
+        // 60% played: proactively build the next route from where this route is at 75%
+        // (leaves a wide 25% reaction margin instead of waiting until 90%!).
+        if (!m_aiPlan.empty() && !m_aiNextReady && !m_aiNextTried && m_aiPlanPos * 10 >= m_aiPlanTotal * 6) {
             m_aiNextTried = true;
-            int p90 = (m_aiPlanTotal * 9 + 9) / 10;        // first position that counts as 90% played
-            int lead = p90 - m_aiPlanPos;
+            int p75 = (m_aiPlanTotal * 3 + 3) / 4;
+            int lead = p75 - m_aiPlanPos;
             if (lead > 0) {
                 bool ok = planAuto(pl, lead);
                 ++m_dbgSearches;
@@ -3254,12 +3631,14 @@ private:
                                          lead, m_aiNextTotal, m_used);
             }
         }
-        // 90% played: follow the new route from here (it was built for exactly this point)
-        if (m_aiPlan.empty() || m_aiPlanPos * 10 >= m_aiPlanTotal * 9) {
+        // 75% played (or invalidated by watchdog): switch to next route or replan from real state
+        if (m_aiPlan.empty() || m_aiPlanPos * 4 >= m_aiPlanTotal * 3) {
             if (m_aiNextReady && !m_aiPlan.empty()) {
                 m_aiPlan = std::move(m_aiNext);
                 m_aiPlanTotal = m_aiNextTotal;
                 m_aiPlanPos = 0;
+                m_aiPlanMode = curMode;
+                m_aiVerifyCounter = 0;
                 m_aiNext.clear();
             } else {                                        // no next route: plan from the real state
                 bool ok = planAuto(pl);
@@ -3270,18 +3649,12 @@ private:
             m_aiNextReady = false;
             m_aiNextTried = false;
         }
-        bool h = m_aiHold;
-        int acc = 0;
-        for (auto const& st : m_aiPlan) {
-            h = st.hold;
-            if (m_aiPlanPos < acc + st.seg) break;
-            acc += st.seg;
-        }
+        bool h = aiHoldAt(m_aiPlan, m_aiPlanPos, m_aiHold);
         m_aiHold = h;
         ++m_aiPlanPos;
         if (m_game[0] != m_aiHold) fire(pl, 0, m_aiHold);
 
-        m_aiTrail.push_back({aiCell(p1->getPositionX()), m_aiHold, m_aiTick});
+        m_aiTrail.push_back({aiCellKey(p1->getPositionX(), p1->getPositionY()), m_aiHold, m_aiTick});
         if (m_aiTrail.size() > 1200) m_aiTrail.pop_front();
     }
 
@@ -3289,9 +3662,9 @@ private:
         auto& c = cfg();
         ++m_aiDeaths;
         if (c.autoLearn) {
-            // blame the actions taken shortly before dying, once per spot,
+            // blame the actions taken shortly before dying, once per 2D spot,
             // the closer to the death the more
-            std::unordered_map<int, float> blame[2];
+            std::unordered_map<int64_t, float> blame[2];
             for (auto const& st : m_aiTrail) {
                 int age = m_aiTick - st.tick;
                 if (age > c.autoWindow) continue;
@@ -3308,7 +3681,7 @@ private:
         m_aiTick = 0;
         m_aiHoldLeft = 0;
         clearAutoPlan();
-        m_aiLastForgiven = {std::numeric_limits<int>::min(), false};
+        m_aiLastForgiven = {std::numeric_limits<int64_t>::min(), false};
     }
 
     // ================================================================ trajectory
@@ -3407,13 +3780,7 @@ private:
 
         int s0 = std::max(1, c.autoStride);
         m_aiHorizon = c.pathHorizon;
-        m_levels.clear();
-        int total = 0;
-        for (int i = 0; total < m_aiHorizon && i < kSlots - 2; ++i) {
-            int seg = i < 6 ? s0 : (s0 << std::min(i - 5, 5));
-            m_levels.push_back(seg);
-            total += seg;
-        }
+        buildAiLevels(m_aiHorizon, s0, false);
 
         beginSearch(pl, 0, false, m_layout == Layout::DualSolo);
         m_budget = c.pathBudget;
@@ -3440,7 +3807,8 @@ private:
             bool died = false;
             for (int i = 0; i < m_bestLen && !stop; ++i) {
                 for (int t = 0; t < m_bestSeg[i]; ++t) {
-                    if (!step(0, m_bestHold[i])) {
+                    bool stepHold = m_bestHold[i] && t < m_bestHoldTicks[i];
+                    if (!step(0, stepHold)) {
                         died = !m_aborted;
                         stop = true;
                         break;

@@ -155,6 +155,7 @@ class $modify(BufEffectGameObject, EffectGameObject) {
     static void onModify(auto& self) {
         (void)self.setHookPriority("EffectGameObject::triggerObject", -1000000);
         (void)self.setHookPriority("EffectGameObject::triggerActivated", -1000000);
+        (void)self.setHookPriority("EffectGameObject::playTriggerEffect", -1000000);
     }
 
     void triggerObject(GJBaseGameLayer* p0, int p1, buf::GdVec<int> const* p2) {
@@ -170,6 +171,11 @@ class $modify(BufEffectGameObject, EffectGameObject) {
     void triggerActivated(float xPosition) {
         if (g_engine.isSimulating()) return;
         EffectGameObject::triggerActivated(xPosition);
+    }
+
+    void playTriggerEffect() {
+        if (g_engine.isSimulating()) return;
+        EffectGameObject::playTriggerEffect();
     }
 };
 
@@ -387,34 +393,40 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             if (cand.capacity() < static_cast<size_t>(objectsCount) + 32) {
                 cand.reserve(static_cast<size_t>(objectsCount) + 32);
             }
+            // Filter out 85-95% non-collidable objects (Decorations, visual triggers) FIRST
+            // so simMove / setPosition / simTouchObjects NEVER touch decoration objects!
             for (int i = 0; i < objectsCount; ++i) {
-                if (GameObject* obj = vec->at(i)) cand.push_back(obj);
+                GameObject* obj = vec->at(i);
+                if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
+                if (!buf::Engine::isRelevantSimObject(obj)) continue;
+                cand.push_back(obj);
             }
             g_engine.beginSimCollision(player);
-            // Also pull in objects from moving groups that slide horizontally into this section
+            // Also pull in nearby collidable objects from moving groups that slide horizontally into this section
             g_engine.appendMovingGroupObjects(this, player, cand);
             int candCount = static_cast<int>(cand.size());
             if (extra.capacity() < static_cast<size_t>(candCount)) {
                 extra.reserve(candCount);
             }
-            // 1. place every moving object at its predicted position & lastPosition for the ghost's time
-            for (int i = 0; i < candCount; ++i) {
-                GameObject* obj = cand[i];
-                if (!obj || obj->m_isDisabled || obj->m_isDisabled2 || obj->m_isGroupDisabled) continue;
-                if (obj->m_groups && obj->m_groupCount > 0) {
-                    CCPoint off, prevOff;
-                    auto st = g_engine.simMove(obj, off, prevOff);
-                    if (st == buf::Engine::MoveState::Predicted) {
-                        if (off.x != 0.f || off.y != 0.f || prevOff.x != 0.f || prevOff.y != 0.f) {
-                            CCPoint orig = obj->getPosition();
-                            moved.push_back({obj, orig, obj->m_lastPosition});
-                            obj->setPosition(orig + off);
-                            obj->m_lastPosition = orig + prevOff;
-                            obj->m_isObjectRectDirty = true;
-                            obj->m_isOrientedBoxDirty = true;
+            // 1. place every relevant moving object at its predicted position & lastPosition for the ghost's time
+            if (g_engine.hasAnySimMove()) {
+                for (int i = 0; i < candCount; ++i) {
+                    GameObject* obj = cand[i];
+                    if (obj->m_groups && obj->m_groupCount > 0) {
+                        CCPoint off, prevOff;
+                        auto st = g_engine.simMove(obj, off, prevOff);
+                        if (st == buf::Engine::MoveState::Predicted) {
+                            if (off.x != 0.f || off.y != 0.f || prevOff.x != 0.f || prevOff.y != 0.f) {
+                                CCPoint orig = obj->getPosition();
+                                moved.push_back({obj, orig, obj->m_lastPosition});
+                                obj->setPosition(orig + off);
+                                obj->m_lastPosition = orig + prevOff;
+                                obj->m_isObjectRectDirty = true;
+                                obj->m_isOrientedBoxDirty = true;
+                            }
+                        } else if (st == buf::Engine::MoveState::Unknown) {
+                            g_engine.flagMovingObject();       // moving, cannot be predicted: do not trust it
                         }
-                    } else if (st == buf::Engine::MoveState::Unknown) {
-                        g_engine.flagMovingObject();       // moving, cannot be predicted: do not trust it
                     }
                 }
             }
