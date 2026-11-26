@@ -7,112 +7,20 @@ on:
       - "**"
 
 jobs:
-  build-v5:
+  build:
     strategy:
       fail-fast: false
       matrix:
         config:
           - name: Windows
-            id: win
             os: windows-2022
             target: Win64
 
           - name: Android32
-            id: android32
             os: ubuntu-latest
             target: Android32
 
           - name: Android64
-            id: android64
-            os: ubuntu-latest
-            target: Android64
-
-    name: Build 2.2081 / Geode v5 (${{ matrix.config.name }})
-    runs-on: ${{ matrix.config.os }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build Geode Mod (GD 2.2081 / Geode 5.11.2)
-        id: build
-        uses: geode-sdk/build-geode-mod@main
-        with:
-          combine: false
-          target: ${{ matrix.config.target }}
-          sdk: given
-          cli: latest
-
-      - name: Upload platform build
-        uses: actions/upload-artifact@v4
-        with:
-          name: geode-v5-${{ matrix.config.id }}
-          path: ${{ steps.build.outputs.build-output }}/*.geode
-          retention-days: 1
-
-  package-v5:
-    name: Combine 2.2081 / Geode v5
-    runs-on: ubuntu-latest
-    needs: [build-v5]
-
-    steps:
-      - name: Setup Geode CLI
-        uses: geode-sdk/cli/.github/actions/setup@main
-        with:
-          version: latest
-
-      - name: Download platform builds
-        uses: actions/download-artifact@v4
-        with:
-          pattern: geode-v5-*
-          path: artifacts
-
-      - name: Merge .geode packages
-        shell: bash
-        run: |
-          mkdir -p out
-          mapfile -t FILES < <(find artifacts -name '*.geode' -type f | sort)
-          if [ "${#FILES[@]}" -eq 0 ]; then
-            echo "No .geode files found!" >&2
-            exit 1
-          fi
-          FIRST="${FILES[0]}"
-          if [ "${#FILES[@]}" -gt 1 ]; then
-            geode package merge --zstd --optimize-pngs "${FILES[@]}"
-          fi
-          cp "$FIRST" out/
-
-      - name: Upload combined mod (GD 2.2081 - Geode v5.11.2)
-        uses: actions/upload-artifact@v4
-        with:
-          name: Build Output (GD 2.2081 - Geode v5.11.2)
-          path: out
-
-      - name: Delete temporary artifacts
-        uses: geekyeggo/delete-artifact@v6
-        with:
-          name: |
-            geode-v5-win
-            geode-v5-android32
-            geode-v5-android64
-          failOnError: false
-
-  build-v6:
-    strategy:
-      fail-fast: false
-      matrix:
-        config:
-          - name: Windows
-            id: win
-            os: windows-2022
-            target: Win64
-
-          - name: Android32
-            id: android32
-            os: ubuntu-latest
-            target: Android32
-
-          - name: Android64
-            id: android64
             os: ubuntu-latest
             target: Android64
 
@@ -122,72 +30,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch mod.json for GD 2.2091 / Geode 6.0.0
-        shell: bash
-        run: |
-          jq '.geode = "6.0.0" | .gd.win = "2.2091" | .gd.android = "2.2091"' mod.json > mod.json.tmp
-          mv mod.json.tmp mod.json
-          cat mod.json
-
-      - name: Build Geode Mod (GD 2.2091 / Geode 6.0.0)
-        id: build
+      - name: Build Geode Mod
         uses: geode-sdk/build-geode-mod@main
         with:
-          combine: false
+          combine: true
           target: ${{ matrix.config.target }}
           sdk: given
           cli: latest
 
-      - name: Upload platform build
-        uses: actions/upload-artifact@v4
-        with:
-          name: geode-v6-${{ matrix.config.id }}
-          path: ${{ steps.build.outputs.build-output }}/*.geode
-          retention-days: 1
-
-  package-v6:
-    name: Combine 2.2091 / Geode v6
+  package:
+    name: Combine platform builds
     runs-on: ubuntu-latest
-    needs: [build-v6]
+    needs: [build]
+    permissions:
+      contents: write
+      actions: write
 
     steps:
-      - name: Setup Geode CLI
-        uses: geode-sdk/cli/.github/actions/setup@main
-        with:
-          version: latest
+      - name: Combine Geode builds
+        uses: geode-sdk/build-geode-mod/combine@main
+        id: build
 
-      - name: Download platform builds
-        uses: actions/download-artifact@v4
-        with:
-          pattern: geode-v6-*
-          path: artifacts
-
-      - name: Merge .geode packages
-        shell: bash
-        run: |
-          mkdir -p out
-          mapfile -t FILES < <(find artifacts -name '*.geode' -type f | sort)
-          if [ "${#FILES[@]}" -eq 0 ]; then
-            echo "No .geode files found!" >&2
-            exit 1
-          fi
-          FIRST="${FILES[0]}"
-          if [ "${#FILES[@]}" -gt 1 ]; then
-            geode package merge --zstd --optimize-pngs "${FILES[@]}"
-          fi
-          cp "$FIRST" out/
-
-      - name: Upload combined mod (GD 2.2091 - Geode v6.0.0)
+      - name: Upload combined mod
         uses: actions/upload-artifact@v4
         with:
           name: Build Output (GD 2.2091 - Geode v6.0.0)
-          path: out
+          path: ${{ steps.build.outputs.build-output }}
 
-      - name: Delete temporary artifacts
-        uses: geekyeggo/delete-artifact@v6
-        with:
-          name: |
-            geode-v6-win
-            geode-v6-android32
-            geode-v6-android64
-          failOnError: false
+      - name: Publish latest release asset
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="latest-2.2091"
+          FILE=$(find "${{ steps.build.outputs.build-output }}" -name '*.geode' -type f | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "No combined .geode file found!" >&2
+            exit 1
+          fi
+          TITLE="Input Buffer (GD 2.2091 / Geode v6.0.0)"
+          NOTES="Combined build (Windows + Android32 + Android64) for GD 2.2091 / Geode v6.0.0 from commit ${GITHUB_SHA}."
+          if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$FILE" --clobber -R "${{ github.repository }}"
+            gh release edit "$TAG" -R "${{ github.repository }}" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$TAG" "$FILE" -R "${{ github.repository }}" --target "${{ github.sha }}" --title "$TITLE" --notes "$NOTES"
+          fi
