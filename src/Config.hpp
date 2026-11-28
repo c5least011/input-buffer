@@ -49,6 +49,7 @@ struct Config {
     int minBudget = 300;                // smallest search budget under spam
     int noclipTicks = 480;              // how long NOCLIP stays flagged after a blocked death
     int failOpen = 4;                   // frames without a physics tick before input is never held
+    int safeMargin = 1;                 // ticks a delayed input is pushed INTO the safe window (away from its edge)
 
     // ship / wave: only act when holding or releasing NOW is about to kill you
     int shipImminent = 16;              // ticks: death sooner than this counts as imminent
@@ -143,6 +144,7 @@ inline void loadConfig() {
     c.minBudget = gi("minBudget", 300, 50, 5000);
     c.noclipTicks = gi("noclipTicks", 480, 0, 5000);
     c.failOpen = gi("failOpen", 4, 1, 60);
+    c.safeMargin = gi("safeMargin", 1, 0, 8);
     c.orbDetect = gb("orbDetect", true);
     c.dropFatal = gb("dropFatal", false);
     c.subTick = gb("subTick", true);
@@ -224,6 +226,7 @@ inline void saveConfig() {
     m->setSavedValue<int64_t>("minBudget", c.minBudget);
     m->setSavedValue<int64_t>("noclipTicks", c.noclipTicks);
     m->setSavedValue<int64_t>("failOpen", c.failOpen);
+    m->setSavedValue<int64_t>("safeMargin", c.safeMargin);
     m->setSavedValue<bool>("orbDetect", c.orbDetect);
     m->setSavedValue<bool>("dropFatal", c.dropFatal);
     m->setSavedValue<bool>("subTick", c.subTick);

@@ -24,6 +24,10 @@ jobs:
             os: ubuntu-latest
             target: Android64
 
+          - name: iOS
+            os: macos-latest
+            target: iOS
+
     name: Build 2.2091 / Geode v6 (${{ matrix.config.name }})
     runs-on: ${{ matrix.config.os }}
 
@@ -69,8 +73,8 @@ jobs:
             echo "No combined .geode file found!" >&2
             exit 1
           fi
-          TITLE="Input Buffer (GD 2.2091 / Geode v6.0.0)"
-          NOTES="Combined build (Windows + Android32 + Android64) for GD 2.2091 / Geode v6.0.0 from commit ${GITHUB_SHA}."
+          TITLE="Input Buffer v1.1.7 (GD 2.2091 / Geode v6.0.0)"
+          NOTES="Combined build (Windows + Android32 + Android64 + iOS) for GD 2.2091 / Geode v6.0.0 from commit ${GITHUB_SHA}."
           if gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1; then
             gh release upload "$TAG" "$FILE" --clobber -R "${{ github.repository }}"
             gh release edit "$TAG" -R "${{ github.repository }}" --title "$TITLE" --notes "$NOTES"

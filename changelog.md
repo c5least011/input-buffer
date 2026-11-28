@@ -24,5 +24,6 @@ made it
 # 1.1.6
 - improve auto
 # 1.1.7
-- update to GD 2.2091 / Geode v6.0.0
+- update to GD 2.2091 / Geode v6.0.0 with iOS support
+- optimize move trigger detection, simulate pads/portals, and upgrade Autoplay
 - fix Log and Config UI alignment

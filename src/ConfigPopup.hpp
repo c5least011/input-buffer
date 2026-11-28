@@ -130,6 +130,8 @@ protected:
 
     void layoutItems(std::vector<Item> const& items) {
         int rows = std::max(4, static_cast<int>((items.size() + 1) / 2));
+        float topY = rows >= 7 ? 76.f : 72.f;
+        float stepY = rows >= 7 ? 24.f : 30.f;
         auto& c = cfg();
         (void)c;
         for (size_t i = 0; i < items.size(); ++i) {
@@ -137,7 +139,7 @@ protected:
             int row = static_cast<int>(i) % rows;
             float labelX = col == 0 ? -205.f : 15.f;
             float ctrlX = col == 0 ? -40.f : 180.f;
-            float y = 72.f - row * 30.f;
+            float y = topY - row * stepY;
 
             auto label = CCLabelBMFont::create(items[i].label.c_str(), "bigFont.fnt");
             label->setScale(.36f);
@@ -562,8 +564,10 @@ protected:
                 number("Min budget (ticks)", &c.minBudget, 50, 5000),
                 number("Noclip memory (ticks)", &c.noclipTicks, 0, 5000),
                 number("Fail-open frames", &c.failOpen, 1, 60),
+                number("Safety margin (ticks)", &c.safeMargin, 0, 8),
             };
             note = "Ship/Wave look: a hold/release must survive this many ticks.\n"
+                   "Safety margin: a delayed input lands this far inside the safe window, not on its edge.\n"
                    "If no delay saves it, a late rescue is tried, else the input goes through raw.\n"
                    "CBF support: with Click Between Frames on, it splits the steps (own sub-tick is off).";
         } else if (tab == 5) {
